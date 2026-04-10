@@ -1,0 +1,1268 @@
+#!/usr/bin/env python3
+"""mncli — lightweight CLI for interacting with a running marimo notebook.
+
+Thin wrapper over the marimo kernel HTTP API (via execute-code.sh) that
+exposes stable verbs (start/status/create/edit/run/delete/install/exec) with
+clean JSON output. Code for create/edit is passed via base64 to dodge all
+shell-escaping nightmares.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 fallback
+    tomllib = None
+
+# marimo's scratchpad renders the final expression's value as HTML into the
+# done-event output, which `execute-code.sh` concatenates onto stdout. Strip
+# the specific wrapper so exec --json yields clean stdout for agents. Only
+# the text-xs <pre> wrapper is stripped — richer HTML is preserved.
+_MARIMO_TEXT_XS_PRE = re.compile(r"<pre class='text-xs'>.*?</pre>\n?", re.DOTALL)
+__version__ = "0.1.2"
+
+
+def _strip_marimo_render(text: str) -> str:
+    return _MARIMO_TEXT_XS_PRE.sub("", text)
+
+
+def _default_execute_script() -> Path:
+    installed = shutil.which("mncli-execute-code")
+    if installed:
+        return Path(installed)
+    sibling = Path(__file__).resolve().with_name("mncli-execute-code")
+    if sibling.exists():
+        return sibling
+    return Path.home() / ".claude/skills/marimo-pair/scripts/execute-code.sh"
+
+
+DEFAULT_EXECUTE_SCRIPT = _default_execute_script()
+EXECUTE_SCRIPT = Path(os.environ.get("MNCLI_EXECUTE_SCRIPT", str(DEFAULT_EXECUTE_SCRIPT)))
+
+
+_TRANSPORT_FAILURE_MARKERS = (
+    "No running marimo instances found",
+    "Failed to connect to marimo server",
+    "No active sessions on the server",
+    "Multiple instances found",
+    "Multiple sessions on server",
+)
+
+
+def _is_transport_failure(stderr: str) -> bool:
+    return any(m in stderr for m in _TRANSPORT_FAILURE_MARKERS)
+
+
+def _print_transport_hint(stderr: str) -> None:
+    sys.stderr.write(stderr if stderr.endswith("\n") else stderr + "\n")
+    if "No running marimo instances found" in stderr:
+        sys.stderr.write(
+            "hint: start a notebook with:\n"
+            "        mncli start <file.py>\n"
+            "      or point at a running server with --url http://host:port\n"
+        )
+    elif "Failed to connect" in stderr:
+        sys.stderr.write(
+            "hint: the URL is unreachable. check the port, or run\n"
+            "        `mncli` with no --url to auto-discover a local server.\n"
+        )
+    elif "No active sessions" in stderr:
+        sys.stderr.write(
+            "hint: the server is up but no notebook is open — open one in the browser.\n"
+        )
+    elif "Multiple" in stderr:
+        sys.stderr.write(
+            "hint: use --port or --session to disambiguate.\n"
+        )
+
+
+def _run_kernel(code: str, extra_args: list[str]) -> tuple[str, str, int]:
+    if not EXECUTE_SCRIPT.exists():
+        sys.stderr.write(
+            f"error: execute transport not found at {EXECUTE_SCRIPT}\n"
+            "       set MNCLI_EXECUTE_SCRIPT to override\n"
+        )
+        sys.exit(2)
+    cmd = [str(EXECUTE_SCRIPT), *extra_args]
+    result = subprocess.run(cmd, input=code, capture_output=True, text=True)
+    return result.stdout, result.stderr, result.returncode
+
+
+def _indent(text: str, prefix: str) -> str:
+    return "\n".join(prefix + line if line else line for line in text.splitlines())
+
+
+def _wrap_snippet(body: str) -> str:
+    return (
+        "import json as _mncli_json, traceback as _mncli_tb\n"
+        "import marimo._code_mode as _mncli_cm\n"
+        "\n"
+        "try:\n"
+        + _indent(body, "    ")
+        + "\n"
+        "except Exception as _mncli_exc:\n"
+        "    print(_mncli_json.dumps({\n"
+        '        "ok": False,\n'
+        '        "error": str(_mncli_exc),\n'
+        '        "type": type(_mncli_exc).__name__,\n'
+        '        "traceback": _mncli_tb.format_exc(),\n'
+        "    }))\n"
+    )
+
+
+def _exec_json(body: str, extra_args: list[str]) -> dict:
+    code = _wrap_snippet(body)
+    stdout, stderr, rc = _run_kernel(code, extra_args)
+    if _is_transport_failure(stderr):
+        _print_transport_hint(stderr)
+        sys.exit(1)
+    lines = [l for l in stdout.splitlines() if l.strip()]
+    if not lines:
+        if stderr:
+            sys.stderr.write(stderr)
+        sys.stderr.write("error: no output from kernel\n")
+        sys.exit(rc or 1)
+    try:
+        data = json.loads(lines[-1])
+    except json.JSONDecodeError:
+        sys.stderr.write(f"error: could not parse kernel output as JSON:\n{stdout}\n")
+        if stderr:
+            sys.stderr.write(stderr)
+        sys.exit(1)
+    if not data.get("ok"):
+        sys.stderr.write(
+            f"error: {data.get('type', 'Error')}: {data.get('error', 'unknown')}\n"
+        )
+        tb = data.get("traceback", "")
+        if tb:
+            sys.stderr.write(tb)
+            if not tb.endswith("\n"):
+                sys.stderr.write("\n")
+        sys.exit(1)
+    return data
+
+
+def _read_code(inline: str | None, source: str | None) -> str:
+    if inline is not None:
+        return inline
+    if source is None or source == "-":
+        if sys.stdin.isatty():
+            sys.stderr.write("error: no code provided (use --code, a file path, or pipe stdin)\n")
+            sys.exit(2)
+        return sys.stdin.read()
+    path_str = source[1:] if source.startswith("@") else source
+    return Path(path_str).read_text()
+
+
+def _encode(code: str) -> str:
+    return base64.b64encode(code.encode("utf-8")).decode("ascii")
+
+
+def _has_exact_tag_marker(code: str, marker: str) -> bool:
+    return code.split("\n", 1)[0] == marker
+
+
+def _transport_args(args: argparse.Namespace) -> list[str]:
+    extra: list[str] = []
+    if args.port:
+        extra += ["--port", args.port]
+    if args.url:
+        extra += ["--url", args.url]
+    if args.session:
+        extra += ["--session", args.session]
+    if args.token:
+        extra += ["--token", args.token]
+    return extra
+
+
+def _marimo_servers_dir() -> Path:
+    ostype = os.environ.get("OSTYPE", "")
+    if ostype.startswith(("msys", "cygwin")):
+        return Path.home() / ".marimo/servers"
+    state_home = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
+    return state_home / "marimo/servers"
+
+
+def _pid_is_live(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _discover_servers(*, cleanup: bool = True) -> tuple[list[dict], Path]:
+    servers_dir = _marimo_servers_dir()
+    if not servers_dir.is_dir():
+        return [], servers_dir
+
+    servers: list[dict] = []
+    for path in servers_dir.glob("*.json"):
+        try:
+            entry = json.loads(path.read_text())
+            pid = int(entry["pid"])
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            continue
+
+        if not _pid_is_live(pid):
+            if cleanup:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            continue
+        servers.append(entry)
+
+    servers.sort(key=lambda e: (str(e.get("host", "")), int(e.get("port") or 0)))
+    return servers, servers_dir
+
+
+def _dependency_name(spec: str) -> str:
+    return re.split(r"[\s<>=!~;\[]", spec, 1)[0].lower()
+
+
+def _find_pyproject(start: Path) -> Path | None:
+    current = start.resolve() if start.exists() else start.absolute()
+    if current.is_file() or current.suffix:
+        current = current.parent
+    for parent in (current, *current.parents):
+        candidate = parent / "pyproject.toml"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _pyproject_has_marimo(pyproject: Path) -> bool:
+    if tomllib is None:
+        try:
+            text = pyproject.read_text()
+        except OSError:
+            return False
+        fallback_pattern = r"(?im)^\s*marimo\b|['\"]marimo(?:[<>=!~;\[]|['\"])"
+        return re.search(fallback_pattern, text) is not None
+
+    try:
+        data = tomllib.loads(pyproject.read_text())
+    except OSError:
+        return False
+    except tomllib.TOMLDecodeError:
+        return False
+
+    project = data.get("project", {})
+    deps = list(project.get("dependencies", []))
+    for group in project.get("optional-dependencies", {}).values():
+        if isinstance(group, list):
+            deps.extend(group)
+    for group in data.get("dependency-groups", {}).values():
+        if isinstance(group, list):
+            deps.extend(group)
+    if any(isinstance(dep, str) and _dependency_name(dep) == "marimo" for dep in deps):
+        return True
+
+    pixi_deps = data.get("tool", {}).get("pixi", {}).get("dependencies", {})
+    if isinstance(pixi_deps, dict) and "marimo" in pixi_deps:
+        return True
+    if isinstance(pixi_deps, list):
+        return any(
+            isinstance(dep, str) and _dependency_name(dep) == "marimo"
+            for dep in pixi_deps
+        )
+    return False
+
+
+def _pyproject_has_pixi_marimo(pyproject: Path) -> bool:
+    if tomllib is None:
+        return False
+
+    try:
+        data = tomllib.loads(pyproject.read_text())
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+
+    pixi_deps = data.get("tool", {}).get("pixi", {}).get("dependencies", {})
+    if isinstance(pixi_deps, dict):
+        return "marimo" in pixi_deps
+    if isinstance(pixi_deps, list):
+        return any(
+            isinstance(dep, str) and _dependency_name(dep) == "marimo"
+            for dep in pixi_deps
+        )
+    return False
+
+
+def _notebook_uses_project_marimo(notebook: Path) -> bool:
+    pyproject = _find_pyproject(notebook)
+    return pyproject is not None and _pyproject_has_marimo(pyproject)
+
+
+def _notebook_uses_pixi_marimo(notebook: Path) -> bool:
+    pyproject = _find_pyproject(notebook)
+    return pyproject is not None and _pyproject_has_pixi_marimo(pyproject)
+
+
+def _resolve_start_runner(runner: str, notebook: Path) -> str:
+    if runner != "auto":
+        if shutil.which(runner) is None:
+            sys.stderr.write(f"error: {runner!r} not found on PATH\n")
+            sys.exit(2)
+        return runner
+
+    if _notebook_uses_pixi_marimo(notebook) and shutil.which("pixi"):
+        return "pixi"
+    if _notebook_uses_project_marimo(notebook) and shutil.which("uv"):
+        return "uv"
+    if shutil.which("uvx"):
+        return "uvx"
+    if shutil.which("marimo"):
+        return "marimo"
+
+    sys.stderr.write(
+        "error: could not find uvx or marimo on PATH\n"
+        "hint: install uv, or pass --runner marimo if marimo is installed elsewhere\n"
+    )
+    sys.exit(2)
+
+
+def _default_start_log(notebook: Path) -> Path:
+    return notebook.with_suffix(".marimo.log")
+
+
+def _build_start_command(args: argparse.Namespace) -> tuple[list[str], Path, Path, str]:
+    notebook = Path(args.notebook).expanduser()
+    runner = _resolve_start_runner(args.runner, notebook)
+    if args.log:
+        log_path = Path(args.log).expanduser()
+    else:
+        log_path = _default_start_log(notebook)
+
+    if runner == "uv":
+        cmd = ["uv", "run", "marimo", "edit", str(notebook)]
+    elif runner == "uvx":
+        cmd = ["uvx", "marimo@latest", "edit", str(notebook)]
+    elif runner == "pixi":
+        cmd = ["pixi", "run", "marimo", "edit", str(notebook)]
+    else:
+        cmd = ["marimo", "edit", str(notebook)]
+
+    cmd.append("--no-token")
+    if args.port:
+        cmd.extend(["--port", str(args.port)])
+    if args.headless:
+        cmd.append("--headless")
+    if args.mcp:
+        cmd.append("--mcp")
+
+    sandbox = args.sandbox
+    if sandbox is None:
+        sandbox = runner not in {"uv", "pixi"}
+    if sandbox:
+        cmd.append("--sandbox")
+
+    return cmd, log_path, notebook, runner
+
+
+def _format_command(cmd: list[str]) -> str:
+    return " ".join(shlex.quote(part) for part in cmd)
+
+
+def _tail_text(path: Path, limit: int = 4000) -> str:
+    try:
+        with path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(size - limit, 0))
+            return f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+# --- commands ---------------------------------------------------------------
+
+
+def cmd_servers(args: argparse.Namespace) -> None:
+    servers, servers_dir = _discover_servers(cleanup=not args.no_cleanup)
+    if args.port:
+        servers = [s for s in servers if str(s.get("port")) == str(args.port)]
+
+    if args.json:
+        print(json.dumps({"ok": True, "registry": str(servers_dir), "servers": servers}, ensure_ascii=False))
+        return
+
+    if not servers:
+        print(f"(no running marimo instances; registry: {servers_dir})")
+        return
+
+    for server in servers:
+        host = server.get("host", "?")
+        port = server.get("port", "?")
+        base_url = server.get("base_url") or ""
+        pid = server.get("pid", "?")
+        server_id = server.get("server_id") or ""
+        print(f"{host}:{port}{base_url}  pid={pid}" + (f"  id={server_id}" if server_id else ""))
+
+
+def cmd_start(args: argparse.Namespace) -> None:
+    if args.url or args.session or args.token:
+        sys.stderr.write("error: start accepts --port, but not --url, --session, or --token\n")
+        sys.exit(2)
+
+    cmd, log_path, notebook, runner = _build_start_command(args)
+    payload = {
+        "ok": True,
+        "dry_run": bool(args.dry_run),
+        "pid": None,
+        "notebook": str(notebook),
+        "log": str(log_path),
+        "runner": runner,
+        "command": cmd,
+    }
+
+    if args.dry_run:
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False))
+        else:
+            print(_format_command(cmd))
+        return
+
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("ab") as log_file:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+    except OSError as exc:
+        sys.stderr.write(f"error: failed to start marimo: {exc}\n")
+        sys.exit(1)
+
+    time.sleep(args.startup_check_seconds)
+    rc = proc.poll()
+    if rc is not None:
+        sys.stderr.write(f"error: marimo exited immediately with code {rc}\n")
+        sys.stderr.write(f"log: {log_path}\n")
+        tail = _tail_text(log_path)
+        if tail:
+            sys.stderr.write("\nlast log output:\n")
+            sys.stderr.write(tail if tail.endswith("\n") else tail + "\n")
+        sys.exit(rc or 1)
+
+    payload["pid"] = proc.pid
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False))
+        return
+
+    print(f"started marimo pid {proc.pid}")
+    print(f"notebook: {notebook}")
+    print(f"log: {log_path}")
+    print(f"command: {_format_command(cmd)}")
+    if args.port:
+        print(f"next: mncli --port {args.port} status")
+    else:
+        print("next: mncli status")
+
+
+STATUS_BODY = r'''
+async with _mncli_cm.get_context() as _ctx:
+    _cells = []
+    for _c in _ctx.cells:
+        _errs = []
+        try:
+            for _e in (_c.errors or []):
+                _errs.append(str(_e))
+        except Exception:
+            pass
+        _preview = (_c.code.split("\n", 1)[0] if _c.code else "").strip()[:80]
+        _cells.append({
+            "id": _c.id,
+            "name": _c.name,
+            "status": str(_c.status),
+            "has_error": bool(_errs),
+            "errors": _errs,
+            "code_preview": _preview,
+            "code_lines": (_c.code.count("\n") + 1) if _c.code else 0,
+        })
+print(_mncli_json.dumps({"ok": True, "cells": _cells}))
+'''
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    data = _exec_json(STATUS_BODY, _transport_args(args))
+    cells = data["cells"]
+    total = len(cells)
+    err_total = sum(1 for c in cells if c["has_error"])
+    if args.errors_only:
+        cells = [c for c in cells if c["has_error"]]
+    if args.json:
+        print(json.dumps(cells, indent=2, ensure_ascii=False))
+        return
+    if not cells:
+        if args.errors_only:
+            print(f"(no errored cells; {total} cell(s) total)")
+        else:
+            print("(no cells)")
+        return
+    for c in cells:
+        marker = "x" if c["has_error"] else "·"
+        preview = c["code_preview"] or "(empty)"
+        print(f"  {marker} {c['id']}  {c['status']:<10s}  {preview}")
+        for e in c["errors"]:
+            for line in e.splitlines():
+                print(f"      ! {line}")
+    if args.errors_only:
+        print(f"\n{len(cells)} errored cell(s) (of {total} total)")
+    else:
+        print(f"\n{total} cell(s), {err_total} with errors")
+
+
+def cmd_show(args: argparse.Namespace) -> None:
+    target = args.id
+    body = (
+        "async with _mncli_cm.get_context() as _ctx:\n"
+        "    _match = None\n"
+        "    for _c in _ctx.cells:\n"
+        f"        if _c.id == {target!r}:\n"
+        "            _match = _c\n"
+        "            break\n"
+        "    if _match is None:\n"
+        f'        _result = {{"ok": True, "found": False, "id": {target!r}}}\n'
+        "    else:\n"
+        "        _errs = []\n"
+        "        try:\n"
+        "            for _e in (_match.errors or []):\n"
+        "                _errs.append(str(_e))\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "        _result = {\n"
+        '            "ok": True,\n'
+        '            "found": True,\n'
+        '            "id": _match.id,\n'
+        '            "name": _match.name,\n'
+        '            "status": str(_match.status),\n'
+        '            "code": _match.code or "",\n'
+        '            "errors": _errs,\n'
+        "        }\n"
+        "print(_mncli_json.dumps(_result))\n"
+    )
+    data = _exec_json(body, _transport_args(args))
+    if not data.get("found"):
+        sys.stderr.write(f"error: cell {target!r} not found\n")
+        sys.exit(1)
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False))
+        return
+    if args.code_only:
+        sys.stdout.write(data["code"])
+        if not data["code"].endswith("\n"):
+            sys.stdout.write("\n")
+        return
+    header = f"# cell {data['id']}  status={data['status']}"
+    if data.get("name"):
+        header += f"  name={data['name']}"
+    if data.get("errors"):
+        header += f"  errors={len(data['errors'])}"
+    print(header)
+    print("# " + "-" * 60)
+    sys.stdout.write(data["code"])
+    if not data["code"].endswith("\n"):
+        sys.stdout.write("\n")
+    for e in data.get("errors", []):
+        sys.stderr.write(f"\n! {e}\n")
+
+
+# Snippet that assumes `_targets` (list[str]) is defined in scope and
+# populates `_post_results` with each target's post-run status/errors.
+_POST_RUN_SNIPPET = (
+    "_post_results = {}\n"
+    "async with _mncli_cm.get_context() as _ctx:\n"
+    "    for _c in _ctx.cells:\n"
+    "        if _c.id in _targets:\n"
+    "            _errs = []\n"
+    "            try:\n"
+    "                for _e in (_c.errors or []):\n"
+    "                    _errs.append(str(_e))\n"
+    "            except Exception:\n"
+    "                pass\n"
+    '            _post_results[_c.id] = {"status": str(_c.status), "errors": _errs}\n'
+)
+
+
+def _render_post_results(results: dict) -> int:
+    err_count = 0
+    for cid, r in results.items():
+        errs = r.get("errors") or []
+        if errs:
+            err_count += 1
+        marker = "x" if errs else "·"
+        print(f"  {marker} {cid}  {r.get('status', '?')}")
+        for e in errs:
+            for line in e.splitlines():
+                print(f"      ! {line}")
+    return err_count
+
+
+def cmd_create(args: argparse.Namespace) -> None:
+    code = _read_code(args.code, args.source)
+    run_after = bool(args.run)
+    tag = args.tag
+    if tag is not None:
+        if not tag or "\n" in tag or "\r" in tag:
+            sys.stderr.write("error: --tag must be a non-empty single-line value\n")
+            sys.exit(2)
+        marker = f"# mncli-tag: {tag}"
+        if not _has_exact_tag_marker(code, marker):
+            code = marker + "\n" + code
+    b64 = _encode(code)
+    marker_repr = repr(f"# mncli-tag: {tag}") if tag is not None else "None"
+    body = (
+        "import base64 as _mncli_b64\n"
+        f'_src = _mncli_b64.b64decode("{b64}").decode("utf-8")\n'
+        f"_marker = {marker_repr}\n"
+        "async with _mncli_cm.get_context() as _ctx:\n"
+        "    _existing = None\n"
+        "    if _marker is not None:\n"
+        "        for _c in _ctx.cells:\n"
+        '            if _c.code and _c.code.split("\\n", 1)[0] == _marker:\n'
+        "                _existing = _c.id\n"
+        "                break\n"
+        "    if _existing is not None:\n"
+        "        _ctx.edit_cell(_existing, _src)\n"
+        "        _cell_id = _existing\n"
+        '        _action = "replaced"\n'
+        "    else:\n"
+        "        _cell = _ctx.create_cell(_src)\n"
+        '        _cell_id = _cell.id if hasattr(_cell, "id") else str(_cell)\n'
+        '        _action = "created"\n'
+    )
+    if run_after:
+        body += (
+            "    _ctx.run_cell(_cell_id)\n"
+            "_targets = [_cell_id]\n"
+            + _POST_RUN_SNIPPET
+            + '_result = {"ok": True, "id": _cell_id, "action": _action, "ran": True, "results": _post_results}\n'
+        )
+    else:
+        body += '_result = {"ok": True, "id": _cell_id, "action": _action, "ran": False}\n'
+    body += "print(_mncli_json.dumps(_result))\n"
+
+    data = _exec_json(body, _transport_args(args))
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False))
+        return
+    action = data.get("action", "created")
+    verb = "replaced" if action == "replaced" else "created"
+    print(f"{verb} {data['id']}" + (" (ran)" if run_after else ""))
+    if run_after:
+        _render_post_results(data.get("results", {}))
+
+
+def cmd_edit(args: argparse.Namespace) -> None:
+    code = _read_code(args.code, args.source)
+    b64 = _encode(code)
+    run_after = bool(args.run)
+    target = args.id
+    body = (
+        "import base64 as _mncli_b64\n"
+        f'_src = _mncli_b64.b64decode("{b64}").decode("utf-8")\n'
+        "async with _mncli_cm.get_context() as _ctx:\n"
+        f"    _ctx.edit_cell({target!r}, _src)\n"
+    )
+    if run_after:
+        body += (
+            f"    _ctx.run_cell({target!r})\n"
+            f"_targets = [{target!r}]\n"
+            + _POST_RUN_SNIPPET
+            + f'_result = {{"ok": True, "id": {target!r}, "ran": True, "results": _post_results}}\n'
+        )
+    else:
+        body += f'_result = {{"ok": True, "id": {target!r}, "ran": False}}\n'
+    body += "print(_mncli_json.dumps(_result))\n"
+
+    data = _exec_json(body, _transport_args(args))
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False))
+        return
+    print(f"edited {data['id']}" + (" (ran)" if run_after else ""))
+    if run_after:
+        _render_post_results(data.get("results", {}))
+
+
+def _run_body(targets_repr: str) -> str:
+    return (
+        f"_targets_input = {targets_repr}\n"
+        "async with _mncli_cm.get_context() as _ctx:\n"
+        '    if _targets_input == "__ALL__":\n'
+        "        _targets = [_c.id for _c in _ctx.cells]\n"
+        "    else:\n"
+        "        _targets = _targets_input\n"
+        "    for _t in _targets:\n"
+        "        _ctx.run_cell(_t)\n"
+        "\n"
+        + _POST_RUN_SNIPPET
+        + '\nprint(_mncli_json.dumps({"ok": True, "ran": _targets, "results": _post_results}))\n'
+    )
+
+
+_RESOLVE_ALL_BODY = (
+    "async with _mncli_cm.get_context() as _ctx:\n"
+    "    _ids = [_c.id for _c in _ctx.cells]\n"
+    'print(_mncli_json.dumps({"ok": True, "ids": _ids}))\n'
+)
+
+
+_RUN_ONE_BODY_TEMPLATE = (
+    "_targets = [__CID__]\n"
+    "async with _mncli_cm.get_context() as _ctx:\n"
+    "    _ctx.run_cell(__CID__)\n"
+    + _POST_RUN_SNIPPET
+    + 'print(_mncli_json.dumps({"ok": True, "ran": _targets, "results": _post_results}))\n'
+)
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    if "all" in args.targets and len(args.targets) > 1:
+        sys.stderr.write("error: 'all' cannot be combined with explicit cell ids\n")
+        sys.exit(2)
+
+    is_all = len(args.targets) == 1 and args.targets[0] == "all"
+    stream = bool(args.stream) and not args.json
+
+    if not stream:
+        # atomic batch mode (existing behavior, preferred for --json)
+        targets_repr = "'__ALL__'" if is_all else repr(list(args.targets))
+        body = _run_body(targets_repr)
+        data = _exec_json(body, _transport_args(args))
+        ran = data.get("ran", [])
+        results = data.get("results", {})
+        if args.json:
+            print(json.dumps(data, indent=2, ensure_ascii=False))
+            return
+        err_count = _render_post_results(results)
+        print(f"\nran {len(ran)} cell(s), {err_count} with errors")
+        return
+
+    # streaming mode: resolve target list, then run one cell at a time,
+    # printing each cell's status as soon as it completes.
+    if is_all:
+        resolved = _exec_json(_RESOLVE_ALL_BODY, _transport_args(args))
+        targets = resolved.get("ids", [])
+    else:
+        targets = list(args.targets)
+
+    total = len(targets)
+    err_count = 0
+    for i, cid in enumerate(targets, 1):
+        body = _RUN_ONE_BODY_TEMPLATE.replace("__CID__", repr(cid))
+        sys.stdout.write(f"  [{i}/{total}] running {cid} ... ")
+        sys.stdout.flush()
+        data = _exec_json(body, _transport_args(args))
+        results = data.get("results", {})
+        r = results.get(cid, {})
+        errs = r.get("errors") or []
+        status = r.get("status", "?")
+        if errs:
+            err_count += 1
+            sys.stdout.write(f"x {status}\n")
+            for e in errs:
+                for line in e.splitlines():
+                    sys.stdout.write(f"      ! {line}\n")
+        else:
+            sys.stdout.write(f"· {status}\n")
+    print(f"\nran {total} cell(s), {err_count} with errors")
+
+
+def cmd_delete(args: argparse.Namespace) -> None:
+    targets = list(args.ids)
+    dry_run = bool(args.dry_run)
+    body = (
+        f"_targets = {targets!r}\n"
+        f"_dry_run = {dry_run}\n"
+        "_results = []\n"
+        "async with _mncli_cm.get_context() as _ctx:\n"
+        "    _existing = {_c.id: _c for _c in _ctx.cells}\n"
+        "    for _tid in _targets:\n"
+        "        _cell = _existing.get(_tid)\n"
+        "        if _cell is None:\n"
+        '            _results.append({"id": _tid, "status": "not_found"})\n'
+        "            continue\n"
+        "        if _dry_run:\n"
+        '            _preview = (_cell.code.split("\\n", 1)[0] if _cell.code else "").strip()[:80]\n'
+        '            _lines = (_cell.code.count("\\n") + 1) if _cell.code else 0\n'
+        "            _results.append({\n"
+        '                "id": _tid,\n'
+        '                "status": "would_delete",\n'
+        '                "code_preview": _preview,\n'
+        '                "code_lines": _lines,\n'
+        "            })\n"
+        "            continue\n"
+        "        _ctx.delete_cell(_tid)\n"
+        '        _results.append({"id": _tid, "status": "deleted"})\n'
+        'print(_mncli_json.dumps({"ok": True, "results": _results}))\n'
+    )
+    data = _exec_json(body, _transport_args(args))
+    results = data.get("results", [])
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False))
+        return
+    for r in results:
+        status = r.get("status")
+        cid = r.get("id")
+        if status == "not_found":
+            print(f"not found: {cid} (already gone, no-op)")
+        elif status == "would_delete":
+            preview = r.get("code_preview", "")
+            lines = r.get("code_lines", 0)
+            print(f"would delete {cid}  ({lines} lines)")
+            if preview:
+                print(f"  preview: {preview}")
+        else:
+            print(f"deleted {cid}")
+
+
+def cmd_install(args: argparse.Namespace) -> None:
+    pkgs = list(args.packages)
+    body = (
+        "async with _mncli_cm.get_context() as _ctx:\n"
+        f"    _ctx.install_packages({pkgs!r})\n"
+        f'print(_mncli_json.dumps({{"ok": True, "packages": {pkgs!r}}}))\n'
+    )
+    data = _exec_json(body, _transport_args(args))
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False))
+    else:
+        print(f"installed: {', '.join(data['packages'])}")
+
+
+def cmd_exec(args: argparse.Namespace) -> None:
+    code = _read_code(args.code, args.source)
+    stdout, stderr, rc = _run_kernel(code, _transport_args(args))
+    if _is_transport_failure(stderr):
+        if args.json:
+            payload = {
+                "ok": False,
+                "exit_code": rc or 1,
+                "stdout": _strip_marimo_render(stdout),
+                "stderr": stderr,
+                "transport_error": True,
+            }
+            print(json.dumps(payload, ensure_ascii=False))
+            sys.exit(rc or 1)
+        _print_transport_hint(stderr)
+        sys.exit(1)
+    if args.json:
+        payload = {
+            "ok": rc == 0,
+            "exit_code": rc,
+            "stdout": _strip_marimo_render(stdout),
+            "stderr": stderr,
+        }
+        print(json.dumps(payload, ensure_ascii=False))
+        sys.exit(0 if rc == 0 else rc)
+    if stdout:
+        sys.stdout.write(stdout)
+        if not stdout.endswith("\n"):
+            sys.stdout.write("\n")
+    if stderr:
+        sys.stderr.write(stderr)
+    sys.exit(rc)
+
+
+def cmd_notes(args: argparse.Namespace) -> None:
+    sys.stdout.write(AGENT_NOTES)
+    if not AGENT_NOTES.endswith("\n"):
+        sys.stdout.write("\n")
+
+
+# --- main -------------------------------------------------------------------
+
+
+def _add_code_input(sp: argparse.ArgumentParser) -> None:
+    sp.add_argument("source", nargs="?", help="code file path, '@file', or '-' for stdin")
+    sp.add_argument("--code", help="inline code (alternative to source)")
+
+
+def _common_parser() -> argparse.ArgumentParser:
+    """Transport flags accepted by kernel-attaching subcommands."""
+    cp = argparse.ArgumentParser(add_help=False)
+    cp.add_argument("--json", action="store_true", help="emit JSON output where applicable")
+    cp.add_argument("--port", help="marimo server port")
+    cp.add_argument("--url", help="marimo server URL (skip discovery)")
+    cp.add_argument("--session", help="session id")
+    cp.add_argument("--token", help="auth token (or set MARIMO_TOKEN)")
+    return cp
+
+
+def _start_common_parser() -> argparse.ArgumentParser:
+    cp = argparse.ArgumentParser(add_help=False)
+    cp.add_argument("--json", action="store_true", help="emit JSON output")
+    cp.add_argument("--port", help="marimo server port")
+    return cp
+
+
+AGENT_NOTES = """\
+AGENT NOTES
+===========
+
+Verb cheatsheet
+---------------
+  servers                        list auto-discoverable marimo servers
+  start [notebook.py]            start marimo in the background
+  start notebook.py --headless   start without opening a browser
+  status                         list cells with status and errors
+  status --errors-only           only show cells currently in error
+  show <id>                      print full cell source (pipe with --code-only)
+  create <src> [--run]           append a new cell
+  create <src> --tag NAME --run  idempotent: replaces a cell tagged NAME
+  edit <id> <src> [--run]        replace a cell's code
+  run <id> [<id>...] | run all   run cell(s), returns post-run status
+  run all --stream               per-cell progress while running
+  delete <id> [<id>...]          delete one or more cells (idempotent)
+  delete <id> --dry-run          preview without deleting
+  install <pkg> [<pkg>...]       install packages into the kernel
+  exec <src>                     scratch-exec Python (streaming stdout/stderr)
+  exec <src> --json              structured {stdout, stderr, exit_code}
+  notes                          this document
+
+Typical workflow
+----------------
+  1. `mncli servers`                     — check whether a local server exists
+  2. `mncli start notebook.py`           — start a background server when none is running
+  3. `mncli status`                      — survey existing cells first
+  4. `mncli show <id>`                   — read a cell's full code when a preview isn't enough
+  5. `mncli install pandas altair`       — add deps via the kernel, never pip/uv
+  6. `mncli create <file> --tag foo --run`
+                                         — build up the notebook with idempotent tagged cells
+  7. `mncli exec --code '...'`           — ad-hoc inspection of notebook state
+  8. `mncli edit <id> <file> --run`      — replace a cell in place when you know its id
+  9. `mncli status --errors-only`        — check for regressions after a change
+
+Caveats baked into marimo's reactive model
+------------------------------------------
+
+  Unique variable names across cells
+    Every top-level name must be defined in EXACTLY ONE cell. Creating a
+    second cell that defines `rows`, `df`, `tmp`, etc. will fail with:
+        RuntimeError: Multiply-defined names: 'rows' is already defined in cell X
+    Workarounds (pick one per helper cell):
+      - Prefix locals with underscore:   `_tmp = ...`, `_rows = [...]`
+      - Wrap in a function:
+            def _build():
+                tmp = ...
+                return tmp
+            result = _build()
+      - `edit` the existing cell instead of `create`-ing a new one.
+
+  Scratch exec is stateless
+    `mncli exec` runs in a fresh scratchpad every time. Variables defined
+    by one `exec` call are gone in the next. BUT: variables defined by
+    NOTEBOOK CELLS are fully visible in every `exec` call. Put state in
+    cells; use `exec` for probes, prints, and type/shape checks.
+
+  exec final-expression render leaks into stdout (plain mode only)
+    If your exec snippet's last expression returns a non-None value,
+    marimo renders it and the rendered HTML (e.g. `<pre class='text-xs'>5</pre>`)
+    ends up mixed into stdout. Mitigations:
+      - End exec snippets with `print(...)` or an explicit `None`.
+      - Or use `exec --json`, which strips the `<pre class='text-xs'>...`
+        wrapper from the `stdout` field automatically.
+
+  Cells don't auto-run on create/edit
+    `create` and `edit` are structural changes — they queue the cell but
+    don't execute it. Pass `--run`, or follow up with `mncli run <id>`.
+
+  Idempotency rules
+    - `create` without `--tag` is NOT idempotent: retries create duplicates.
+      Use `--tag NAME` to make it idempotent — the first run creates a cell
+      with a `# mncli-tag: NAME` marker prepended; subsequent runs with the
+      same tag replace that cell in place.
+    - `edit`, `run`, `install`, `delete` are all idempotent by construction.
+    - `delete` returns status "not_found" (exit 0) when the id is already
+      gone — safe to retry after a timeout.
+
+  Install via `mncli install`, never pip/uv
+    The kernel has its own package manager. `pip install` or `uv add`
+    will bypass it and may require a kernel restart.
+
+  Do not write to the .py file directly
+    The kernel owns the notebook file while the session is open. Editing
+    it from outside (Write, sed, manual edits) will confuse marimo.
+    Always go through `create` / `edit`.
+
+Finding and fixing errors
+-------------------------
+  - After `run`, `create --run`, or `edit --run`, the response already
+    includes post-run status per cell — check `results[cid].errors`.
+  - `mncli status --errors-only` lists only cells currently in error.
+    Equivalent JSON query: `mncli status --json | jq '.[] | select(.has_error)'`.
+  - Error messages are plain text — no HTML-wrapped tracebacks. If you
+    need more detail, reproduce in `mncli exec` which streams stdout and
+    stderr raw.
+  - For long runs, `mncli run all --stream` prints per-cell progress as
+    each cell completes — you can watch for the first `x` marker and
+    cancel early instead of waiting for the whole notebook.
+
+Input conventions
+-----------------
+  create / edit / exec accept code from any of:
+    --code 'x = 1'            inline
+    /path/to/cell.py          file path (also works with @/path)
+    -                         explicit stdin
+    (no arg, piped stdin)     implicit stdin from pipe
+
+  For multi-line cell code, prefer writing to a temp file first rather
+  than wrestling with shell quoting — e.g.:
+      cat > /tmp/cell.py <<'EOF'
+      import pandas as pd
+      df = pd.read_csv("/tmp/data.csv")
+      mo.ui.table(df.head())
+      EOF
+      mncli create /tmp/cell.py --tag load-data --run
+
+Transport
+---------
+  mncli is a thin Python wrapper over the marimo kernel HTTP API. Under
+  the hood it shells out to the skill's execute-code.sh. Override via:
+      MNCLI_EXECUTE_SCRIPT=/path/to/execute-code.sh
+
+  `mncli start [notebook.py]` starts a marimo edit server in the background,
+  writes logs beside the notebook by default, and uses --no-token so the
+  session is auto-discoverable. It checks briefly for immediate startup
+  failure and prints the log tail when marimo exits. It uses pixi for pixi
+  projects, uv for uv projects, and outside a project it prefers:
+      uvx marimo@latest edit notebook.py --no-token --sandbox
+
+  `mncli servers` lists the local marimo registry and removes stale entries
+  by default, matching marimo-pair's discover-before-start workflow.
+
+  Connection flags are passed through to the transport layer: --port, --url,
+  --session, --token (or MARIMO_TOKEN). `start` accepts --port only.
+
+  Transport failures produce a targeted hint: "no instances found" points
+  you at `uvx marimo edit`, "failed to connect" points at the URL, etc.
+"""
+
+
+def _examples_epilog(lines: list[str]) -> str:
+    return "Examples:\n" + "\n".join("  " + line for line in lines)
+
+
+def _subparser(
+    sub: "argparse._SubParsersAction",
+    common: argparse.ArgumentParser,
+    name: str,
+    *,
+    help: str,
+    examples: list[str],
+) -> argparse.ArgumentParser:
+    return sub.add_parser(
+        name,
+        help=help,
+        parents=[common],
+        epilog=_examples_epilog(examples),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    common = _common_parser()
+    start_common = _start_common_parser()
+    p = argparse.ArgumentParser(
+        prog="mncli",
+        description=(
+            "CLI for driving a running marimo notebook from an agent or script. "
+            "Exposes stable verbs with clean JSON output and no shell-escaping "
+            "headaches. Run `mncli notes` for agent-focused gotchas and conventions."
+        ),
+        parents=[common],
+    )
+    p.add_argument("--version", action="version", version=f"mncli {__version__}")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = _subparser(sub, start_common, "servers",
+        help="list auto-discoverable local marimo servers",
+        examples=[
+            "mncli servers",
+            "mncli servers --json",
+            "mncli servers --port 2718",
+        ],
+    )
+    sp.add_argument("--no-cleanup", action="store_true",
+                    help="do not remove stale registry entries for dead processes")
+    sp.set_defaults(func=cmd_servers)
+
+    sp = _subparser(sub, start_common, "start",
+        help="start a marimo notebook server in the background",
+        examples=[
+            "mncli start notebook.py",
+            "mncli start analysis.py --headless --port 2718",
+            "mncli start analysis.py --runner uv --no-sandbox",
+            "mncli start analysis.py --dry-run",
+        ],
+    )
+    sp.add_argument("notebook", nargs="?", default="notebook.py",
+                    help="notebook path to open or create (default: notebook.py)")
+    sp.add_argument("--runner", choices=["auto", "uvx", "uv", "pixi", "marimo"], default="auto",
+                    help="how to invoke marimo (default: auto)")
+    sp.add_argument("--headless", action="store_true",
+                    help="do not open the notebook in a browser")
+    sp.add_argument("--mcp", action="store_true",
+                    help="start marimo with its MCP server enabled")
+    sp.add_argument("--log",
+                    help="log file path (default: <notebook>.marimo.log)")
+    sp.add_argument("--dry-run", action="store_true",
+                    help="print the command without starting marimo")
+    sp.add_argument("--startup-check-seconds", type=float, default=0.25,
+                    help="seconds to wait for immediate startup failure (default: 0.25)")
+    sandbox = sp.add_mutually_exclusive_group()
+    sandbox.add_argument("--sandbox", dest="sandbox", action="store_true",
+                         default=None,
+                         help="force marimo sandbox mode")
+    sandbox.add_argument("--no-sandbox", dest="sandbox", action="store_false",
+                         help="disable marimo sandbox mode")
+    sp.set_defaults(func=cmd_start)
+
+    sp = _subparser(sub, common, "status",
+        help="list cells with status and errors",
+        examples=[
+            "mncli status",
+            "mncli status --errors-only        # only cells currently in error",
+            "mncli status --json",
+            "mncli status --json | jq '.[] | select(.has_error)'",
+        ],
+    )
+    sp.add_argument("--errors-only", action="store_true",
+                    help="only show cells that currently have errors")
+    sp.set_defaults(func=cmd_status)
+
+    sp = _subparser(sub, common, "show",
+        help="print the full code of a cell",
+        examples=[
+            "mncli show PotT",
+            "mncli show PotT --code-only > /tmp/cell.py",
+            "mncli show PotT --json",
+        ],
+    )
+    sp.add_argument("id", help="cell id")
+    sp.add_argument("--code-only", action="store_true",
+                    help="print only the cell source, no header")
+    sp.set_defaults(func=cmd_show)
+
+    sp = _subparser(sub, common, "create",
+        help="create a new cell (append to notebook); idempotent with --tag",
+        examples=[
+            "mncli create --code 'x = 42' --run",
+            "mncli create /tmp/cell.py --run",
+            "echo 'import pandas as pd' | mncli create --run",
+            "mncli create /tmp/cell.py --tag my-chart --run   # idempotent: rerun replaces in place",
+        ],
+    )
+    _add_code_input(sp)
+    sp.add_argument("--run", action="store_true", help="run the new cell after creating")
+    sp.add_argument("--tag", metavar="NAME",
+                    help="make this create idempotent: if a cell already starts with "
+                         "`# mncli-tag: NAME` it is replaced; otherwise a new cell is "
+                         "created with that marker prepended")
+    sp.set_defaults(func=cmd_create)
+
+    sp = _subparser(sub, common, "edit",
+        help="replace an existing cell's code",
+        examples=[
+            "mncli edit PotT --code 'x = 100' --run",
+            "mncli edit PotT /tmp/updated.py --run",
+            "cat new_code.py | mncli edit PotT",
+        ],
+    )
+    sp.add_argument("id", help="cell id (see `mncli status`)")
+    _add_code_input(sp)
+    sp.add_argument("--run", action="store_true", help="run the cell after editing")
+    sp.set_defaults(func=cmd_edit)
+
+    sp = _subparser(sub, common, "run",
+        help="run one or more cells (or 'all')",
+        examples=[
+            "mncli run PotT",
+            "mncli run PotT AbCd ZxYw",
+            "mncli run all",
+            "mncli run all --stream           # per-cell progress as they complete",
+            "mncli run all --json             # atomic batch, full post-run status per cell",
+        ],
+    )
+    sp.add_argument("targets", nargs="+", help="cell id(s) or 'all'")
+    sp.add_argument("--stream", action="store_true",
+                    help="run cells one at a time and print progress as each completes "
+                         "(slower due to per-cell HTTP overhead; ignored with --json)")
+    sp.set_defaults(func=cmd_run)
+
+    sp = _subparser(sub, common, "delete",
+        help="delete one or more cells (idempotent — no error if already gone)",
+        examples=[
+            "mncli delete PotT",
+            "mncli delete PotT AbCd ZxYw          # multiple ids in one call",
+            "mncli delete PotT --dry-run          # preview without deleting",
+        ],
+    )
+    sp.add_argument("ids", nargs="+", help="cell id(s) to delete")
+    sp.add_argument("--dry-run", action="store_true",
+                    help="show what would be deleted without deleting")
+    sp.set_defaults(func=cmd_delete)
+
+    sp = _subparser(sub, common, "install",
+        help="install packages into the kernel",
+        examples=[
+            "mncli install pandas",
+            "mncli install pandas altair numpy",
+        ],
+    )
+    sp.add_argument("packages", nargs="+")
+    sp.set_defaults(func=cmd_install)
+
+    sp = _subparser(sub, common, "exec",
+        help="scratch-exec Python in the kernel (sees notebook state, no persistence)",
+        examples=[
+            "mncli exec --code 'print(df.head())'",
+            "mncli exec /tmp/probe.py",
+            "echo 'print(plates.shape)' | mncli exec",
+            "mncli exec --code 'print(df.describe())' --json   # structured stdout/stderr/exit",
+            "mncli exec --code 'print(dir(ctx))'    # explore code_mode API",
+        ],
+    )
+    _add_code_input(sp)
+    sp.set_defaults(func=cmd_exec)
+
+    sp = _subparser(sub, common, "notes",
+        help="print agent-focused gotchas and conventions",
+        examples=[
+            "mncli notes",
+            "mncli notes | less",
+        ],
+    )
+    sp.set_defaults(func=cmd_notes)
+
+    return p
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
