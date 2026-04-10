@@ -8,8 +8,8 @@ version = "0.1.2"
 description = "Lightweight CLI for interacting with a running marimo notebook"
 readme = "README.md"
 requires-python = ">=3.10"
-license = "MIT"
-license-files = ["LICENSE"]
+license = "MIT AND Apache-2.0"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md", "licenses/*"]
 authors = [
   { name = "Yogev" },
 ]

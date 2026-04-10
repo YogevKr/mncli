@@ -98,6 +98,15 @@ UV_TOOL_DIR=/tmp/mncli-uv-tools UV_TOOL_BIN_DIR=/tmp/mncli-uv-bin uv tool instal
 /tmp/mncli-uv-bin/mncli --version
 ```
 
+## Credits
+
+`mncli-execute-code` is derived from
+[`marimo-team/marimo-pair`](https://github.com/marimo-team/marimo-pair)'s
+`scripts/execute-code.sh`, licensed under Apache-2.0.
+
 ## License
 
-MIT
+Most of this project is MIT licensed. The bundled `mncli-execute-code`
+transport includes code derived from `marimo-team/marimo-pair` under
+Apache-2.0. See `THIRD_PARTY_NOTICES.md` and
+`licenses/marimo-pair-APACHE-2.0.txt`.
