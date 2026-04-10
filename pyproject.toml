@@ -29,6 +29,11 @@ classifiers = [
 ]
 dependencies = []
 
+[project.urls]
+Homepage = "https://github.com/YogevKr/mncli"
+Repository = "https://github.com/YogevKr/mncli"
+Issues = "https://github.com/YogevKr/mncli/issues"
+
 [tool.setuptools]
 py-modules = []
 script-files = ["mncli", "mncli-execute-code"]

@@ -40,8 +40,11 @@ Make sure uv's tool bin directory is on `PATH`:
 uv tool dir --bin
 ```
 
-After publishing the Git repository, install from its remote URL with
-`uv tool install`.
+From GitHub:
+
+```sh
+uv tool install git+https://github.com/YogevKr/mncli.git
+```
 
 ## Usage
 
