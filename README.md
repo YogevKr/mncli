@@ -55,6 +55,12 @@ mncli servers
 mncli start analysis.py --headless --port 2718
 ```
 
+`mncli start` waits for the marimo server registry entry before returning. A
+headless start only launches the server; marimo does not create an active
+notebook session until the notebook is opened in a browser, so `status`/`exec`
+will fail with "No active sessions" until then. If the first `uvx` run is slow,
+increase `--registration-timeout-seconds`.
+
 For pixi-managed projects:
 
 ```sh

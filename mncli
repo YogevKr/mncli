@@ -19,6 +19,8 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 try:
@@ -80,7 +82,9 @@ def _print_transport_hint(stderr: str) -> None:
         )
     elif "No active sessions" in stderr:
         sys.stderr.write(
-            "hint: the server is up but no notebook is open — open one in the browser.\n"
+            "hint: the server is up but no notebook session is active. If you used\n"
+            "      `mncli start --headless`, open the registered URL in a browser before\n"
+            "      running status/create/edit/exec.\n"
         )
     elif "Multiple" in stderr:
         sys.stderr.write(
@@ -231,6 +235,86 @@ def _discover_servers(*, cleanup: bool = True) -> tuple[list[dict], Path]:
 
     servers.sort(key=lambda e: (str(e.get("host", "")), int(e.get("port") or 0)))
     return servers, servers_dir
+
+
+def _server_registry_key(server: dict) -> str:
+    server_id = server.get("server_id")
+    if server_id:
+        return f"id:{server_id}"
+    return "pid:{pid}|host:{host}|port:{port}|base:{base_url}".format(
+        pid=server.get("pid"),
+        host=server.get("host"),
+        port=server.get("port"),
+        base_url=server.get("base_url"),
+    )
+
+
+def _find_new_registered_server(
+    servers: list[dict],
+    *,
+    previous_keys: set[str],
+    port: str | None,
+) -> dict | None:
+    for server in servers:
+        if port is not None and str(server.get("port")) != str(port):
+            continue
+        if _server_registry_key(server) not in previous_keys:
+            return server
+    return None
+
+
+def _server_url(server: dict) -> str:
+    host = str(server.get("host") or "127.0.0.1")
+    if host == "0.0.0.0":
+        host = "127.0.0.1"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    base_url = server.get("base_url") or ""
+    return f"http://{host}:{server.get('port')}{base_url}"
+
+
+def _read_server_session_ids(
+    server: dict,
+    *,
+    timeout_seconds: float = 1.0,
+) -> tuple[list[str] | None, str | None]:
+    try:
+        with urllib.request.urlopen(
+            f"{_server_url(server)}/api/sessions",
+            timeout=timeout_seconds,
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, ValueError) as exc:
+        return None, str(exc)
+
+    if not isinstance(payload, dict):
+        return None, "unexpected /api/sessions response"
+    return sorted(str(session_id) for session_id in payload), None
+
+
+def _wait_for_server_registration(
+    proc: subprocess.Popen,
+    *,
+    previous_keys: set[str],
+    port: str | None,
+    timeout_seconds: float,
+) -> tuple[dict | None, Path, int | None]:
+    deadline = time.monotonic() + max(timeout_seconds, 0.0)
+    servers_dir = _marimo_servers_dir()
+    while True:
+        servers, servers_dir = _discover_servers(cleanup=True)
+        server = _find_new_registered_server(servers, previous_keys=previous_keys, port=port)
+        if server is not None:
+            return server, servers_dir, None
+
+        rc = proc.poll()
+        if rc is not None:
+            return None, servers_dir, rc
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None, servers_dir, None
+        time.sleep(min(0.1, remaining))
 
 
 def _dependency_name(spec: str) -> str:
@@ -423,12 +507,18 @@ def cmd_start(args: argparse.Namespace) -> None:
         sys.exit(2)
 
     cmd, log_path, notebook, runner = _build_start_command(args)
+    servers_dir = _marimo_servers_dir()
     payload = {
         "ok": True,
         "dry_run": bool(args.dry_run),
         "pid": None,
         "notebook": str(notebook),
         "log": str(log_path),
+        "registry": str(servers_dir),
+        "server": None,
+        "server_url": None,
+        "session_ids": None,
+        "session_error": None,
         "runner": runner,
         "command": cmd,
     }
@@ -439,6 +529,10 @@ def cmd_start(args: argparse.Namespace) -> None:
         else:
             print(_format_command(cmd))
         return
+
+    existing_servers, servers_dir = _discover_servers(cleanup=True)
+    existing_server_keys = {_server_registry_key(server) for server in existing_servers}
+    payload["registry"] = str(servers_dir)
 
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -454,7 +548,8 @@ def cmd_start(args: argparse.Namespace) -> None:
         sys.stderr.write(f"error: failed to start marimo: {exc}\n")
         sys.exit(1)
 
-    time.sleep(args.startup_check_seconds)
+    startup_check_seconds = max(float(getattr(args, "startup_check_seconds", 0.25)), 0.0)
+    time.sleep(startup_check_seconds)
     rc = proc.poll()
     if rc is not None:
         sys.stderr.write(f"error: marimo exited immediately with code {rc}\n")
@@ -465,7 +560,44 @@ def cmd_start(args: argparse.Namespace) -> None:
             sys.stderr.write(tail if tail.endswith("\n") else tail + "\n")
         sys.exit(rc or 1)
 
+    registration_timeout_seconds = max(
+        float(getattr(args, "registration_timeout_seconds", 15.0)),
+        0.0,
+    )
+    server, servers_dir, rc = _wait_for_server_registration(
+        proc,
+        previous_keys=existing_server_keys,
+        port=args.port,
+        timeout_seconds=registration_timeout_seconds,
+    )
+    payload["registry"] = str(servers_dir)
+    if rc is not None:
+        sys.stderr.write(f"error: marimo exited before registering with code {rc}\n")
+        sys.stderr.write(f"log: {log_path}\n")
+        tail = _tail_text(log_path)
+        if tail:
+            sys.stderr.write("\nlast log output:\n")
+            sys.stderr.write(tail if tail.endswith("\n") else tail + "\n")
+        sys.exit(rc or 1)
+    if server is None:
+        sys.stderr.write(
+            f"error: marimo pid {proc.pid} did not register within "
+            f"{registration_timeout_seconds:g}s\n"
+        )
+        sys.stderr.write(f"registry: {servers_dir}\n")
+        sys.stderr.write(f"log: {log_path}\n")
+        tail = _tail_text(log_path)
+        if tail:
+            sys.stderr.write("\nlast log output:\n")
+            sys.stderr.write(tail if tail.endswith("\n") else tail + "\n")
+        sys.exit(1)
+
     payload["pid"] = proc.pid
+    payload["server"] = server
+    payload["server_url"] = _server_url(server)
+    session_ids, session_error = _read_server_session_ids(server)
+    payload["session_ids"] = session_ids
+    payload["session_error"] = session_error
     if args.json:
         print(json.dumps(payload, ensure_ascii=False))
         return
@@ -473,11 +605,30 @@ def cmd_start(args: argparse.Namespace) -> None:
     print(f"started marimo pid {proc.pid}")
     print(f"notebook: {notebook}")
     print(f"log: {log_path}")
+    server_pid = server.get("pid")
+    server_pid_suffix = f"  pid={server_pid}" if server_pid is not None else ""
+    print(f"registered: {payload['server_url']}{server_pid_suffix}")
     print(f"command: {_format_command(cmd)}")
-    if args.port:
-        print(f"next: mncli --port {args.port} status")
+
+    if session_ids is None:
+        print(f"session check: failed ({session_error})")
+        print("next: check the server URL in a browser, then run mncli status")
+    elif not session_ids:
+        print("sessions: none")
+        print(f"open: {payload['server_url']}")
+        if args.port:
+            print(f"next: open the notebook, then mncli --port {args.port} status")
+        else:
+            print("next: open the notebook, then mncli status")
+    elif len(session_ids) == 1:
+        print(f"session: {session_ids[0]}")
+        if args.port:
+            print(f"next: mncli --port {args.port} status")
+        else:
+            print("next: mncli status")
     else:
-        print("next: mncli status")
+        print(f"sessions: {len(session_ids)} active")
+        print("next: use --session with status/create/edit/run/delete/install/exec")
 
 
 STATUS_BODY = r'''
@@ -1045,7 +1196,10 @@ Transport
   `mncli start [notebook.py]` starts a marimo edit server in the background,
   writes logs beside the notebook by default, and uses --no-token so the
   session is auto-discoverable. It checks briefly for immediate startup
-  failure and prints the log tail when marimo exits. It uses pixi for pixi
+  failure, waits for marimo's registry entry, reports whether an active
+  notebook session exists, and prints the log tail when startup fails. A
+  headless server can be registered with zero active sessions; open the
+  registered URL before running status/create/edit/exec. It uses pixi for pixi
   projects, uv for uv projects, and outside a project it prefers:
       uvx marimo@latest edit notebook.py --no-token --sandbox
 
@@ -1131,6 +1285,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="print the command without starting marimo")
     sp.add_argument("--startup-check-seconds", type=float, default=0.25,
                     help="seconds to wait for immediate startup failure (default: 0.25)")
+    sp.add_argument("--registration-timeout-seconds", type=float, default=15.0,
+                    help="seconds to wait for marimo server registry entry (default: 15)")
     sandbox = sp.add_mutually_exclusive_group()
     sandbox.add_argument("--sandbox", dest="sandbox", action="store_true",
                          default=None,

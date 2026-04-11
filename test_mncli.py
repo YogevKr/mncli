@@ -37,6 +37,7 @@ def _args(**kwargs):
         "sandbox": None,
         "dry_run": False,
         "startup_check_seconds": 0,
+        "registration_timeout_seconds": 0,
     }
     defaults.update(kwargs)
     return types.SimpleNamespace(**defaults)
@@ -264,20 +265,71 @@ class MncliTests(unittest.TestCase):
                 log=str(log_path),
             )
             proc = types.SimpleNamespace(pid=1234, poll=lambda: None)
+            server = {
+                "pid": 1234,
+                "host": "127.0.0.1",
+                "port": 2718,
+                "server_id": "abc",
+            }
 
             with mock.patch.object(mncli.shutil, "which", return_value="/usr/bin/uvx"):
-                with mock.patch.object(mncli.subprocess, "Popen", return_value=proc) as popen:
-                    out = io.StringIO()
-                    with contextlib.redirect_stdout(out):
-                        mncli.cmd_start(args)
+                with mock.patch.object(mncli, "_discover_servers", return_value=([], Path("/registry"))):
+                    with mock.patch.object(
+                        mncli,
+                        "_wait_for_server_registration",
+                        return_value=(server, Path("/registry"), None),
+                    ) as wait:
+                        with mock.patch.object(mncli, "_read_server_session_ids", return_value=(["sess"], None)):
+                            with mock.patch.object(mncli.subprocess, "Popen", return_value=proc) as popen:
+                                out = io.StringIO()
+                                with contextlib.redirect_stdout(out):
+                                    mncli.cmd_start(args)
 
             self.assertTrue(log_path.exists())
             self.assertIn("started marimo pid 1234", out.getvalue())
+            self.assertIn("registered: http://127.0.0.1:2718  pid=1234", out.getvalue())
+            self.assertIn("session: sess", out.getvalue())
             popen.assert_called_once()
             _, kwargs = popen.call_args
             self.assertIs(kwargs["stdin"], mncli.subprocess.DEVNULL)
             self.assertIs(kwargs["stderr"], mncli.subprocess.STDOUT)
             self.assertTrue(kwargs["start_new_session"])
+            wait.assert_called_once()
+
+    def test_start_reports_no_active_session_after_headless_registration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "server.log"
+            args = _args(
+                notebook=str(Path(tmp) / "analysis.py"),
+                runner="uvx",
+                log=str(log_path),
+                headless=True,
+                port="2718",
+            )
+            proc = types.SimpleNamespace(pid=1234, poll=lambda: None)
+            server = {
+                "pid": 1234,
+                "host": "127.0.0.1",
+                "port": 2718,
+                "server_id": "abc",
+            }
+
+            with mock.patch.object(mncli.shutil, "which", return_value="/usr/bin/uvx"):
+                with mock.patch.object(mncli, "_discover_servers", return_value=([], Path("/registry"))):
+                    with mock.patch.object(
+                        mncli,
+                        "_wait_for_server_registration",
+                        return_value=(server, Path("/registry"), None),
+                    ):
+                        with mock.patch.object(mncli, "_read_server_session_ids", return_value=([], None)):
+                            with mock.patch.object(mncli.subprocess, "Popen", return_value=proc):
+                                out = io.StringIO()
+                                with contextlib.redirect_stdout(out):
+                                    mncli.cmd_start(args)
+
+            self.assertIn("sessions: none", out.getvalue())
+            self.assertIn("open: http://127.0.0.1:2718", out.getvalue())
+            self.assertIn("next: open the notebook, then mncli --port 2718 status", out.getvalue())
 
     def test_start_reports_immediate_exit_with_log_tail(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -290,15 +342,73 @@ class MncliTests(unittest.TestCase):
             proc = types.SimpleNamespace(pid=1234, poll=lambda: 2)
 
             with mock.patch.object(mncli.shutil, "which", return_value="/usr/bin/uvx"):
-                with mock.patch.object(mncli.subprocess, "Popen", return_value=proc):
-                    err = io.StringIO()
-                    with contextlib.redirect_stderr(err):
-                        with self.assertRaises(SystemExit) as raised:
-                            mncli.cmd_start(args)
+                with mock.patch.object(mncli, "_discover_servers", return_value=([], Path("/registry"))):
+                    with mock.patch.object(mncli.subprocess, "Popen", return_value=proc):
+                        err = io.StringIO()
+                        with contextlib.redirect_stderr(err):
+                            with self.assertRaises(SystemExit) as raised:
+                                mncli.cmd_start(args)
 
             self.assertEqual(raised.exception.code, 2)
             self.assertIn("marimo exited immediately with code 2", err.getvalue())
             self.assertIn("log:", err.getvalue())
+
+    def test_start_reports_registration_timeout_with_log_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "server.log"
+            log_path.write_text("sandbox failed\n")
+            args = _args(
+                notebook=str(Path(tmp) / "analysis.py"),
+                runner="uvx",
+                log=str(log_path),
+                registration_timeout_seconds=0,
+            )
+            proc = types.SimpleNamespace(pid=1234, poll=lambda: None)
+
+            with mock.patch.object(mncli.shutil, "which", return_value="/usr/bin/uvx"):
+                with mock.patch.object(mncli, "_discover_servers", return_value=([], Path("/registry"))):
+                    with mock.patch.object(
+                        mncli,
+                        "_wait_for_server_registration",
+                        return_value=(None, Path("/registry"), None),
+                    ):
+                        with mock.patch.object(mncli.subprocess, "Popen", return_value=proc):
+                            err = io.StringIO()
+                            with contextlib.redirect_stderr(err):
+                                with self.assertRaises(SystemExit) as raised:
+                                    mncli.cmd_start(args)
+
+            self.assertEqual(raised.exception.code, 1)
+            self.assertIn("did not register within 0s", err.getvalue())
+            self.assertIn("registry: /registry", err.getvalue())
+            self.assertIn("sandbox failed", err.getvalue())
+
+    def test_wait_for_server_registration_requires_new_matching_entry(self):
+        old = {"pid": 1111, "host": "127.0.0.1", "port": 2718, "server_id": "old"}
+        new = {"pid": 2222, "host": "127.0.0.1", "port": 2719, "server_id": "new"}
+        proc = types.SimpleNamespace(pid=3333, poll=lambda: None)
+
+        with mock.patch.object(mncli, "_discover_servers", return_value=([old], Path("/registry"))):
+            server, servers_dir, rc = mncli._wait_for_server_registration(
+                proc,
+                previous_keys={mncli._server_registry_key(old)},
+                port="2718",
+                timeout_seconds=0,
+            )
+        self.assertIsNone(server)
+        self.assertEqual(servers_dir, Path("/registry"))
+        self.assertIsNone(rc)
+
+        with mock.patch.object(mncli, "_discover_servers", return_value=([old, new], Path("/registry"))):
+            server, servers_dir, rc = mncli._wait_for_server_registration(
+                proc,
+                previous_keys={mncli._server_registry_key(old)},
+                port="2719",
+                timeout_seconds=0,
+            )
+        self.assertEqual(server, new)
+        self.assertEqual(servers_dir, Path("/registry"))
+        self.assertIsNone(rc)
 
 
 if __name__ == "__main__":
