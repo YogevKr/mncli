@@ -67,26 +67,93 @@ def _is_transport_failure(stderr: str) -> bool:
     return any(m in stderr for m in _TRANSPORT_FAILURE_MARKERS)
 
 
+def _transport_failure_kind(stderr: str) -> str:
+    if "No running marimo instances found" in stderr:
+        return "no_instances"
+    if "Failed to connect" in stderr:
+        return "failed_connect"
+    if "No active sessions" in stderr:
+        return "no_active_sessions"
+    if "Multiple instances found" in stderr:
+        return "multiple_instances"
+    if "Multiple sessions on server" in stderr:
+        return "multiple_sessions"
+    return "transport_error"
+
+
+def _transport_failure_hint(kind: str) -> str:
+    if kind == "no_instances":
+        return "Start a notebook with `mncli start <file.py> --json`, or pass --url for a running server."
+    if kind == "failed_connect":
+        return "The server URL is unreachable. Check the port or run without --url to auto-discover a local server."
+    if kind == "no_active_sessions":
+        return "The server is up but no notebook session is active. If you used --headless, open the registered URL before status/create/edit/exec."
+    if kind == "multiple_instances":
+        return "Pass --port, or choose a port from `mncli servers --json`."
+    if kind == "multiple_sessions":
+        return "Pass --session with the intended session id."
+    return "Check the marimo server and transport flags."
+
+
+def _transport_failure_payload(
+    stderr: str,
+    *,
+    stdout: str = "",
+    exit_code: int = 1,
+) -> dict:
+    kind = _transport_failure_kind(stderr)
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    payload = {
+        "ok": False,
+        "exit_code": exit_code or 1,
+        "transport_error": True,
+        "kind": kind,
+        "message": lines[0] if lines else kind,
+        "hint": _transport_failure_hint(kind),
+        "stderr": stderr,
+    }
+    if stdout:
+        payload["stdout"] = _strip_marimo_render(stdout)
+    if kind == "multiple_instances":
+        ports = []
+        for line in lines[1:]:
+            match = re.search(r":(\d+)(?:\b|$)", line)
+            if match:
+                ports.append(match.group(1))
+        if ports:
+            payload["ports"] = ports
+    elif kind == "multiple_sessions":
+        sessions = []
+        for line in lines[1:]:
+            parts = line.split(maxsplit=1)
+            if parts:
+                sessions.append({"id": parts[0], "filename": parts[1] if len(parts) > 1 else ""})
+        if sessions:
+            payload["sessions"] = sessions
+    return payload
+
+
 def _print_transport_hint(stderr: str) -> None:
     sys.stderr.write(stderr if stderr.endswith("\n") else stderr + "\n")
-    if "No running marimo instances found" in stderr:
+    kind = _transport_failure_kind(stderr)
+    if kind == "no_instances":
         sys.stderr.write(
             "hint: start a notebook with:\n"
             "        mncli start <file.py>\n"
             "      or point at a running server with --url http://host:port\n"
         )
-    elif "Failed to connect" in stderr:
+    elif kind == "failed_connect":
         sys.stderr.write(
             "hint: the URL is unreachable. check the port, or run\n"
             "        `mncli` with no --url to auto-discover a local server.\n"
         )
-    elif "No active sessions" in stderr:
+    elif kind == "no_active_sessions":
         sys.stderr.write(
             "hint: the server is up but no notebook session is active. If you used\n"
             "      `mncli start --headless`, open the registered URL in a browser before\n"
             "      running status/create/edit/exec.\n"
         )
-    elif "Multiple" in stderr:
+    elif kind in {"multiple_instances", "multiple_sessions"}:
         sys.stderr.write(
             "hint: use --port or --session to disambiguate.\n"
         )
@@ -126,10 +193,13 @@ def _wrap_snippet(body: str) -> str:
     )
 
 
-def _exec_json(body: str, extra_args: list[str]) -> dict:
+def _exec_json(body: str, extra_args: list[str], *, json_errors: bool = False) -> dict:
     code = _wrap_snippet(body)
     stdout, stderr, rc = _run_kernel(code, extra_args)
     if _is_transport_failure(stderr):
+        if json_errors:
+            print(json.dumps(_transport_failure_payload(stderr, stdout=stdout, exit_code=rc or 1), ensure_ascii=False))
+            sys.exit(rc or 1)
         _print_transport_hint(stderr)
         sys.exit(1)
     lines = [l for l in stdout.splitlines() if l.strip()]
@@ -199,6 +269,11 @@ def _marimo_servers_dir() -> Path:
     return state_home / "marimo/servers"
 
 
+def _mncli_servers_dir() -> Path:
+    state_home = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
+    return state_home / "mncli" / "servers"
+
+
 def _pid_is_live(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -249,6 +324,114 @@ def _server_registry_key(server: dict) -> str:
     )
 
 
+def _server_state_path(server: dict) -> Path:
+    safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", _server_registry_key(server))
+    return _mncli_servers_dir() / f"{safe_key}.json"
+
+
+def _normalize_notebook_path(notebook: Path | str) -> str:
+    return str(Path(notebook).expanduser().resolve())
+
+
+def _write_server_state(
+    server: dict,
+    *,
+    notebook: Path,
+    log_path: Path,
+    runner: str,
+    command: list[str],
+) -> None:
+    payload = {
+        "server_id": server.get("server_id"),
+        "pid": server.get("pid"),
+        "host": server.get("host"),
+        "port": server.get("port"),
+        "base_url": server.get("base_url"),
+        "notebook": str(notebook),
+        "notebook_abs": _normalize_notebook_path(notebook),
+        "log": str(log_path),
+        "runner": runner,
+        "command": command,
+        "updated_at": time.time(),
+    }
+    path = _server_state_path(server)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    except OSError:
+        pass
+
+
+def _read_server_state(server: dict) -> dict | None:
+    try:
+        payload = json.loads(_server_state_path(server).read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if payload.get("pid") != server.get("pid"):
+        return None
+    return payload
+
+
+def _read_process_command(pid: int | str | None) -> str:
+    if pid is None:
+        return ""
+    try:
+        completed = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return ""
+    if completed.returncode != 0:
+        return ""
+    return completed.stdout.strip()
+
+
+def _server_matches_notebook(server: dict, notebook: Path) -> bool:
+    target = _normalize_notebook_path(notebook)
+    state = _read_server_state(server)
+    if state is not None and state.get("notebook_abs") == target:
+        return True
+
+    command = _read_process_command(server.get("pid"))
+    if not command:
+        return False
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    candidates = {str(notebook), target}
+    for token in tokens:
+        if token in candidates:
+            return True
+    return False
+
+
+def _find_reusable_server(
+    servers: list[dict],
+    *,
+    notebook: Path,
+    port: str | None,
+) -> dict | None:
+    for server in servers:
+        if port is not None and str(server.get("port")) != str(port):
+            continue
+        if _server_matches_notebook(server, notebook):
+            return server
+    return None
+
+
+def _find_server_on_port(servers: list[dict], port: str | None) -> dict | None:
+    if port is None:
+        return None
+    for server in servers:
+        if str(server.get("port")) == str(port):
+            return server
+    return None
+
+
 def _find_new_registered_server(
     servers: list[dict],
     *,
@@ -290,6 +473,63 @@ def _read_server_session_ids(
     if not isinstance(payload, dict):
         return None, "unexpected /api/sessions response"
     return sorted(str(session_id) for session_id in payload), None
+
+
+def _wait_for_server_session_ids(
+    server: dict,
+    *,
+    timeout_seconds: float,
+    poll_interval_seconds: float = 0.25,
+) -> tuple[list[str] | None, str | None]:
+    deadline = time.monotonic() + max(timeout_seconds, 0.0)
+    last_ids: list[str] | None = None
+    last_error: str | None = None
+    while True:
+        last_ids, last_error = _read_server_session_ids(server)
+        if last_ids:
+            return last_ids, last_error
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return last_ids, last_error
+        time.sleep(min(poll_interval_seconds, remaining))
+
+
+def _next_step_for_start(
+    *,
+    server: dict | None,
+    session_ids: list[str] | None,
+    session_error: str | None,
+    args: argparse.Namespace,
+) -> str:
+    if server is None:
+        return "check the log and retry"
+    port = str(server.get("port"))
+    if session_ids is None:
+        return "check the server URL in a browser, then run mncli status"
+    if not session_ids:
+        return f"open {_server_url(server)}, then run mncli --port {port} status"
+    if len(session_ids) == 1:
+        return f"mncli --port {port} status"
+    return "use --session with status/create/edit/run/delete/install/exec"
+
+
+def _add_start_session_state(
+    payload: dict,
+    *,
+    server: dict | None,
+    session_ids: list[str] | None,
+    session_error: str | None,
+    args: argparse.Namespace,
+) -> None:
+    payload["session_ids"] = session_ids
+    payload["session_error"] = session_error
+    payload["ready_for_cells"] = bool(session_ids) and len(session_ids) == 1
+    payload["next"] = _next_step_for_start(
+        server=server,
+        session_ids=session_ids,
+        session_error=session_error,
+        args=args,
+    )
 
 
 def _wait_for_server_registration(
@@ -465,6 +705,15 @@ def _format_command(cmd: list[str]) -> str:
     return " ".join(shlex.quote(part) for part in cmd)
 
 
+def _format_elapsed(seconds: float) -> str:
+    if seconds < 10:
+        return f"{seconds:.2f}s"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, remainder = divmod(seconds, 60)
+    return f"{int(minutes)}m{remainder:04.1f}s"
+
+
 def _tail_text(path: Path, limit: int = 4000) -> str:
     try:
         with path.open("rb") as f:
@@ -501,6 +750,57 @@ def cmd_servers(args: argparse.Namespace) -> None:
         print(f"{host}:{port}{base_url}  pid={pid}" + (f"  id={server_id}" if server_id else ""))
 
 
+def _print_start_summary(payload: dict, args: argparse.Namespace) -> None:
+    if payload.get("reused"):
+        print(f"reusing marimo pid {payload.get('pid')}")
+    else:
+        print(f"started marimo pid {payload.get('pid')}")
+    print(f"notebook: {payload['notebook']}")
+    print(f"log: {payload['log']}")
+    server = payload.get("server") or {}
+    server_pid = server.get("pid")
+    server_pid_suffix = f"  pid={server_pid}" if server_pid is not None else ""
+    print(f"registered: {payload['server_url']}{server_pid_suffix}")
+    print(f"ready_for_cells: {str(bool(payload.get('ready_for_cells'))).lower()}")
+    print(f"command: {_format_command(payload['command'])}")
+
+    session_ids = payload.get("session_ids")
+    session_error = payload.get("session_error")
+    if session_ids is None:
+        print(f"session check: failed ({session_error})")
+    elif not session_ids:
+        print("sessions: none")
+        print(f"open: {payload['server_url']}")
+    elif len(session_ids) == 1:
+        print(f"session: {session_ids[0]}")
+    else:
+        print(f"sessions: {len(session_ids)} active")
+    print(f"next: {payload.get('next')}")
+
+
+def _emit_start_payload(payload: dict, args: argparse.Namespace, *, exit_code: int = 0) -> None:
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        _print_start_summary(payload, args)
+    if exit_code:
+        sys.exit(exit_code)
+
+
+def _fail_start(message: str, payload: dict, args: argparse.Namespace, *, exit_code: int = 1) -> None:
+    payload["ok"] = False
+    payload["error"] = message
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        sys.stderr.write(f"error: {message}\n")
+        if payload.get("server_url"):
+            sys.stderr.write(f"server: {payload['server_url']}\n")
+        if payload.get("next"):
+            sys.stderr.write(f"next: {payload['next']}\n")
+    sys.exit(exit_code)
+
+
 def cmd_start(args: argparse.Namespace) -> None:
     if args.url or args.session or args.token:
         sys.stderr.write("error: start accepts --port, but not --url, --session, or --token\n")
@@ -511,6 +811,8 @@ def cmd_start(args: argparse.Namespace) -> None:
     payload = {
         "ok": True,
         "dry_run": bool(args.dry_run),
+        "headless": bool(args.headless),
+        "reused": False,
         "pid": None,
         "notebook": str(notebook),
         "log": str(log_path),
@@ -519,6 +821,8 @@ def cmd_start(args: argparse.Namespace) -> None:
         "server_url": None,
         "session_ids": None,
         "session_error": None,
+        "ready_for_cells": False,
+        "next": None,
         "runner": runner,
         "command": cmd,
     }
@@ -533,6 +837,54 @@ def cmd_start(args: argparse.Namespace) -> None:
     existing_servers, servers_dir = _discover_servers(cleanup=True)
     existing_server_keys = {_server_registry_key(server) for server in existing_servers}
     payload["registry"] = str(servers_dir)
+
+    reuse = bool(getattr(args, "reuse", True)) and not bool(getattr(args, "force_new", False))
+    existing_on_port = _find_server_on_port(existing_servers, args.port)
+    reusable_server = _find_reusable_server(existing_servers, notebook=notebook, port=args.port)
+    if reusable_server is not None and reuse:
+        reusable_state = _read_server_state(reusable_server) or {}
+        payload["reused"] = True
+        payload["pid"] = reusable_server.get("pid")
+        payload["notebook"] = reusable_state.get("notebook", payload["notebook"])
+        payload["log"] = reusable_state.get("log", payload["log"])
+        payload["runner"] = reusable_state.get("runner", payload["runner"])
+        payload["command"] = reusable_state.get("command", payload["command"])
+        payload["server"] = reusable_server
+        payload["server_url"] = _server_url(reusable_server)
+        if getattr(args, "wait_session", False):
+            session_ids, session_error = _wait_for_server_session_ids(
+                reusable_server,
+                timeout_seconds=float(getattr(args, "session_timeout_seconds", 15.0)),
+            )
+        else:
+            session_ids, session_error = _read_server_session_ids(reusable_server)
+        _add_start_session_state(
+            payload,
+            server=reusable_server,
+            session_ids=session_ids,
+            session_error=session_error,
+            args=args,
+        )
+        if getattr(args, "wait_session", False) and not payload["ready_for_cells"]:
+            _fail_start("no active notebook session before --wait-session timeout", payload, args)
+        _emit_start_payload(payload, args)
+        return
+    if existing_on_port is not None:
+        payload["server"] = existing_on_port
+        payload["server_url"] = _server_url(existing_on_port)
+        _add_start_session_state(
+            payload,
+            server=existing_on_port,
+            session_ids=None,
+            session_error="port already has a running marimo server",
+            args=args,
+        )
+        _fail_start(
+            f"port {args.port} already has a running marimo server; use that port or choose another",
+            payload,
+            args,
+            exit_code=2,
+        )
 
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -595,40 +947,24 @@ def cmd_start(args: argparse.Namespace) -> None:
     payload["pid"] = proc.pid
     payload["server"] = server
     payload["server_url"] = _server_url(server)
-    session_ids, session_error = _read_server_session_ids(server)
-    payload["session_ids"] = session_ids
-    payload["session_error"] = session_error
-    if args.json:
-        print(json.dumps(payload, ensure_ascii=False))
-        return
-
-    print(f"started marimo pid {proc.pid}")
-    print(f"notebook: {notebook}")
-    print(f"log: {log_path}")
-    server_pid = server.get("pid")
-    server_pid_suffix = f"  pid={server_pid}" if server_pid is not None else ""
-    print(f"registered: {payload['server_url']}{server_pid_suffix}")
-    print(f"command: {_format_command(cmd)}")
-
-    if session_ids is None:
-        print(f"session check: failed ({session_error})")
-        print("next: check the server URL in a browser, then run mncli status")
-    elif not session_ids:
-        print("sessions: none")
-        print(f"open: {payload['server_url']}")
-        if args.port:
-            print(f"next: open the notebook, then mncli --port {args.port} status")
-        else:
-            print("next: open the notebook, then mncli status")
-    elif len(session_ids) == 1:
-        print(f"session: {session_ids[0]}")
-        if args.port:
-            print(f"next: mncli --port {args.port} status")
-        else:
-            print("next: mncli status")
+    _write_server_state(server, notebook=notebook, log_path=log_path, runner=runner, command=cmd)
+    if getattr(args, "wait_session", False):
+        session_ids, session_error = _wait_for_server_session_ids(
+            server,
+            timeout_seconds=float(getattr(args, "session_timeout_seconds", 15.0)),
+        )
     else:
-        print(f"sessions: {len(session_ids)} active")
-        print("next: use --session with status/create/edit/run/delete/install/exec")
+        session_ids, session_error = _read_server_session_ids(server)
+    _add_start_session_state(
+        payload,
+        server=server,
+        session_ids=session_ids,
+        session_error=session_error,
+        args=args,
+    )
+    if getattr(args, "wait_session", False) and not payload["ready_for_cells"]:
+        _fail_start("no active notebook session before --wait-session timeout", payload, args)
+    _emit_start_payload(payload, args)
 
 
 STATUS_BODY = r'''
@@ -656,7 +992,7 @@ print(_mncli_json.dumps({"ok": True, "cells": _cells}))
 
 
 def cmd_status(args: argparse.Namespace) -> None:
-    data = _exec_json(STATUS_BODY, _transport_args(args))
+    data = _exec_json(STATUS_BODY, _transport_args(args), json_errors=args.json)
     cells = data["cells"]
     total = len(cells)
     err_total = sum(1 for c in cells if c["has_error"])
@@ -713,7 +1049,7 @@ def cmd_show(args: argparse.Namespace) -> None:
         "        }\n"
         "print(_mncli_json.dumps(_result))\n"
     )
-    data = _exec_json(body, _transport_args(args))
+    data = _exec_json(body, _transport_args(args), json_errors=args.json)
     if not data.get("found"):
         sys.stderr.write(f"error: cell {target!r} not found\n")
         sys.exit(1)
@@ -814,13 +1150,16 @@ def cmd_create(args: argparse.Namespace) -> None:
         body += '_result = {"ok": True, "id": _cell_id, "action": _action, "ran": False}\n'
     body += "print(_mncli_json.dumps(_result))\n"
 
-    data = _exec_json(body, _transport_args(args))
+    started_at = time.monotonic()
+    data = _exec_json(body, _transport_args(args), json_errors=args.json)
+    elapsed_seconds = time.monotonic() - started_at
+    data["elapsed_seconds"] = elapsed_seconds
     if args.json:
         print(json.dumps(data, ensure_ascii=False))
         return
     action = data.get("action", "created")
     verb = "replaced" if action == "replaced" else "created"
-    print(f"{verb} {data['id']}" + (" (ran)" if run_after else ""))
+    print(f"{verb} {data['id']}" + (f" (ran in {_format_elapsed(elapsed_seconds)})" if run_after else ""))
     if run_after:
         _render_post_results(data.get("results", {}))
 
@@ -847,11 +1186,14 @@ def cmd_edit(args: argparse.Namespace) -> None:
         body += f'_result = {{"ok": True, "id": {target!r}, "ran": False}}\n'
     body += "print(_mncli_json.dumps(_result))\n"
 
-    data = _exec_json(body, _transport_args(args))
+    started_at = time.monotonic()
+    data = _exec_json(body, _transport_args(args), json_errors=args.json)
+    elapsed_seconds = time.monotonic() - started_at
+    data["elapsed_seconds"] = elapsed_seconds
     if args.json:
         print(json.dumps(data, ensure_ascii=False))
         return
-    print(f"edited {data['id']}" + (" (ran)" if run_after else ""))
+    print(f"edited {data['id']}" + (f" (ran in {_format_elapsed(elapsed_seconds)})" if run_after else ""))
     if run_after:
         _render_post_results(data.get("results", {}))
 
@@ -900,20 +1242,23 @@ def cmd_run(args: argparse.Namespace) -> None:
         # atomic batch mode (existing behavior, preferred for --json)
         targets_repr = "'__ALL__'" if is_all else repr(list(args.targets))
         body = _run_body(targets_repr)
-        data = _exec_json(body, _transport_args(args))
+        started_at = time.monotonic()
+        data = _exec_json(body, _transport_args(args), json_errors=args.json)
+        elapsed_seconds = time.monotonic() - started_at
+        data["elapsed_seconds"] = elapsed_seconds
         ran = data.get("ran", [])
         results = data.get("results", {})
         if args.json:
             print(json.dumps(data, indent=2, ensure_ascii=False))
             return
         err_count = _render_post_results(results)
-        print(f"\nran {len(ran)} cell(s), {err_count} with errors")
+        print(f"\nran {len(ran)} cell(s), {err_count} with errors in {_format_elapsed(elapsed_seconds)}")
         return
 
     # streaming mode: resolve target list, then run one cell at a time,
     # printing each cell's status as soon as it completes.
     if is_all:
-        resolved = _exec_json(_RESOLVE_ALL_BODY, _transport_args(args))
+        resolved = _exec_json(_RESOLVE_ALL_BODY, _transport_args(args), json_errors=False)
         targets = resolved.get("ids", [])
     else:
         targets = list(args.targets)
@@ -924,19 +1269,21 @@ def cmd_run(args: argparse.Namespace) -> None:
         body = _RUN_ONE_BODY_TEMPLATE.replace("__CID__", repr(cid))
         sys.stdout.write(f"  [{i}/{total}] running {cid} ... ")
         sys.stdout.flush()
-        data = _exec_json(body, _transport_args(args))
+        started_at = time.monotonic()
+        data = _exec_json(body, _transport_args(args), json_errors=False)
+        elapsed = _format_elapsed(time.monotonic() - started_at)
         results = data.get("results", {})
         r = results.get(cid, {})
         errs = r.get("errors") or []
         status = r.get("status", "?")
         if errs:
             err_count += 1
-            sys.stdout.write(f"x {status}\n")
+            sys.stdout.write(f"x {status} in {elapsed}\n")
             for e in errs:
                 for line in e.splitlines():
                     sys.stdout.write(f"      ! {line}\n")
         else:
-            sys.stdout.write(f"· {status}\n")
+            sys.stdout.write(f"· {status} in {elapsed}\n")
     print(f"\nran {total} cell(s), {err_count} with errors")
 
 
@@ -968,7 +1315,7 @@ def cmd_delete(args: argparse.Namespace) -> None:
         '        _results.append({"id": _tid, "status": "deleted"})\n'
         'print(_mncli_json.dumps({"ok": True, "results": _results}))\n'
     )
-    data = _exec_json(body, _transport_args(args))
+    data = _exec_json(body, _transport_args(args), json_errors=args.json)
     results = data.get("results", [])
     if args.json:
         print(json.dumps(data, ensure_ascii=False))
@@ -995,7 +1342,7 @@ def cmd_install(args: argparse.Namespace) -> None:
         f"    _ctx.install_packages({pkgs!r})\n"
         f'print(_mncli_json.dumps({{"ok": True, "packages": {pkgs!r}}}))\n'
     )
-    data = _exec_json(body, _transport_args(args))
+    data = _exec_json(body, _transport_args(args), json_errors=args.json)
     if args.json:
         print(json.dumps(data, ensure_ascii=False))
     else:
@@ -1007,14 +1354,7 @@ def cmd_exec(args: argparse.Namespace) -> None:
     stdout, stderr, rc = _run_kernel(code, _transport_args(args))
     if _is_transport_failure(stderr):
         if args.json:
-            payload = {
-                "ok": False,
-                "exit_code": rc or 1,
-                "stdout": _strip_marimo_render(stdout),
-                "stderr": stderr,
-                "transport_error": True,
-            }
-            print(json.dumps(payload, ensure_ascii=False))
+            print(json.dumps(_transport_failure_payload(stderr, stdout=stdout, exit_code=rc or 1), ensure_ascii=False))
             sys.exit(rc or 1)
         _print_transport_hint(stderr)
         sys.exit(1)
@@ -1046,15 +1386,15 @@ def cmd_notes(args: argparse.Namespace) -> None:
 
 
 def _add_code_input(sp: argparse.ArgumentParser) -> None:
-    sp.add_argument("source", nargs="?", help="code file path, '@file', or '-' for stdin")
-    sp.add_argument("--code", help="inline code (alternative to source)")
+    sp.add_argument("source", nargs="?", help="code file path, '@file', or '-' for stdin; prefer this for multiline code")
+    sp.add_argument("--code", help="inline one-liner code (alternative to source)")
 
 
 def _common_parser() -> argparse.ArgumentParser:
     """Transport flags accepted by kernel-attaching subcommands."""
     cp = argparse.ArgumentParser(add_help=False)
     cp.add_argument("--json", action="store_true", help="emit JSON output where applicable")
-    cp.add_argument("--port", help="marimo server port")
+    cp.add_argument("--port", help="marimo server port; pass the port returned by `mncli start --json`")
     cp.add_argument("--url", help="marimo server URL (skip discovery)")
     cp.add_argument("--session", help="session id")
     cp.add_argument("--token", help="auth token (or set MARIMO_TOKEN)")
@@ -1068,6 +1408,26 @@ def _start_common_parser() -> argparse.ArgumentParser:
     return cp
 
 
+MAIN_HELP_EPILOG = """\
+Agent authoring quick path:
+  1. Start once:       mncli start notebook.py --json
+  2. Capture port:     use payload.server.port on every later command
+  3. Survey cells:     mncli status --port PORT --json
+  4. Add cells:        mncli create --port PORT --tag name --run -
+  5. Probe state:      mncli exec --port PORT --json -
+  6. Final check:      mncli status --port PORT --errors-only --json
+
+Rules for agents:
+  - Do not use --headless when you need status/create/edit/exec now.
+  - --headless starts a server only; a browser session must open before cell commands work.
+  - Use mncli start notebook.py --wait-session --json when a cell command must work immediately.
+  - Prefer stdin or a temp file for multiline code; reserve --code for one-liners.
+  - Prefer mncli exec --json for notebook-state validation; do not assume bare python exists.
+  - Keep outputs small: do not render all images/base64 blobs at once; use file paths plus a selector or pagination.
+  - If multiple instances are found, do not start another server; choose a port from `mncli servers --json`.
+"""
+
+
 AGENT_NOTES = """\
 AGENT NOTES
 ===========
@@ -1076,6 +1436,8 @@ Verb cheatsheet
 ---------------
   servers                        list auto-discoverable marimo servers
   start [notebook.py]            start marimo in the background
+  start notebook.py --wait-session
+                                 wait until status/create/edit/exec can attach
   start notebook.py --headless   start without opening a browser
   status                         list cells with status and errors
   status --errors-only           only show cells currently in error
@@ -1095,15 +1457,17 @@ Verb cheatsheet
 Typical workflow
 ----------------
   1. `mncli servers`                     — check whether a local server exists
-  2. `mncli start notebook.py`           — start a background server when none is running
-  3. `mncli status`                      — survey existing cells first
+  2. `mncli start notebook.py --json`    — start/reuse server and capture the port
+  3. `mncli status --port PORT`          — survey existing cells first
   4. `mncli show <id>`                   — read a cell's full code when a preview isn't enough
   5. `mncli install pandas altair`       — add deps via the kernel, never pip/uv
-  6. `mncli create <file> --tag foo --run`
+  6. `mncli create --port PORT <file> --tag foo --run`
                                          — build up the notebook with idempotent tagged cells
-  7. `mncli exec --code '...'`           — ad-hoc inspection of notebook state
-  8. `mncli edit <id> <file> --run`      — replace a cell in place when you know its id
-  9. `mncli status --errors-only`        — check for regressions after a change
+  7. `mncli exec --port PORT --json -`   — ad-hoc inspection of notebook state
+  8. `mncli edit --port PORT <id> <file> --run`
+                                         — replace a cell in place when you know its id
+  9. `mncli status --port PORT --errors-only`
+                                         — check for regressions after a change
 
 Caveats baked into marimo's reactive model
 ------------------------------------------
@@ -1148,9 +1512,21 @@ Caveats baked into marimo's reactive model
     - `delete` returns status "not_found" (exit 0) when the id is already
       gone — safe to retry after a timeout.
 
+  Start reuses matching notebooks
+    `mncli start notebook.py` records the started notebook path and reuses a
+    live matching server on the next call. Pass `--force-new` to intentionally
+    create a second server. If you pass an occupied --port for another server,
+    start exits before spawning a doomed duplicate.
+
   Install via `mncli install`, never pip/uv
     The kernel has its own package manager. `pip install` or `uv add`
     will bypass it and may require a kernel restart.
+
+  Keep rendered outputs bounded
+    Marimo rejects very large outputs. For media review notebooks, do not
+    inline all images as base64 or render every row/card at once. Write media
+    to local files, reference those paths in HTML, and render one item/page at
+    a time with a selector, table pagination, or limit.
 
   Do not write to the .py file directly
     The kernel owns the notebook file while the session is open. Editing
@@ -1185,7 +1561,7 @@ Input conventions
       df = pd.read_csv("/tmp/data.csv")
       mo.ui.table(df.head())
       EOF
-      mncli create /tmp/cell.py --tag load-data --run
+      mncli create --port PORT /tmp/cell.py --tag load-data --run
 
 Transport
 ---------
@@ -1197,10 +1573,11 @@ Transport
   writes logs beside the notebook by default, and uses --no-token so the
   session is auto-discoverable. It checks briefly for immediate startup
   failure, waits for marimo's registry entry, reports whether an active
-  notebook session exists, and prints the log tail when startup fails. A
-  headless server can be registered with zero active sessions; open the
-  registered URL before running status/create/edit/exec. It uses pixi for pixi
-  projects, uv for uv projects, and outside a project it prefers:
+  notebook session exists, and prints the log tail when startup fails. Pass
+  `--wait-session` to exit nonzero unless exactly one session is ready for
+  status/create/edit/exec. A headless server can be registered with zero active
+  sessions; open the registered URL before running status/create/edit/exec. It
+  uses pixi for pixi projects, uv for uv projects, and outside a project it prefers:
       uvx marimo@latest edit notebook.py --no-token --sandbox
 
   `mncli servers` lists the local marimo registry and removes stale entries
@@ -1243,8 +1620,10 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "CLI for driving a running marimo notebook from an agent or script. "
             "Exposes stable verbs with clean JSON output and no shell-escaping "
-            "headaches. Run `mncli notes` for agent-focused gotchas and conventions."
+            "headaches."
         ),
+        epilog=MAIN_HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         parents=[common],
     )
     p.add_argument("--version", action="version", version=f"mncli {__version__}")
@@ -1265,8 +1644,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp = _subparser(sub, start_common, "start",
         help="start a marimo notebook server in the background",
         examples=[
-            "mncli start notebook.py",
-            "mncli start analysis.py --headless --port 2718",
+            "mncli start notebook.py --json                  # authoring: capture returned port",
+            "mncli start notebook.py --wait-session --json   # wait until cell commands can attach",
+            "mncli start analysis.py --port 2718 --json",
+            "mncli start analysis.py --headless --port 2718  # server only; open URL before cell commands",
+            "mncli start analysis.py --force-new             # bypass matching-notebook reuse",
             "mncli start analysis.py --runner uv --no-sandbox",
             "mncli start analysis.py --dry-run",
         ],
@@ -1276,7 +1658,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--runner", choices=["auto", "uvx", "uv", "pixi", "marimo"], default="auto",
                     help="how to invoke marimo (default: auto)")
     sp.add_argument("--headless", action="store_true",
-                    help="do not open the notebook in a browser")
+                    help="server only: no active session until the notebook is opened in a browser")
+    sp.add_argument("--wait-session", action="store_true",
+                    help="wait for exactly one active notebook session; exits nonzero on timeout")
+    sp.add_argument("--session-timeout-seconds", type=float, default=15.0,
+                    help="seconds to wait with --wait-session (default: 15)")
+    sp.add_argument("--force-new", action="store_true",
+                    help="start a new server even when a matching notebook server is already running")
+    sp.add_argument("--no-reuse", dest="reuse", action="store_false", default=True,
+                    help="do not reuse a matching notebook server")
     sp.add_argument("--mcp", action="store_true",
                     help="start marimo with its MCP server enabled")
     sp.add_argument("--log",
@@ -1298,10 +1688,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp = _subparser(sub, common, "status",
         help="list cells with status and errors",
         examples=[
-            "mncli status",
+            "mncli status --port 2718",
             "mncli status --errors-only        # only cells currently in error",
-            "mncli status --json",
-            "mncli status --json | jq '.[] | select(.has_error)'",
+            "mncli status --port 2718 --json",
+            "mncli status --port 2718 --errors-only --json",
         ],
     )
     sp.add_argument("--errors-only", action="store_true",
@@ -1324,10 +1714,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp = _subparser(sub, common, "create",
         help="create a new cell (append to notebook); idempotent with --tag",
         examples=[
-            "mncli create --code 'x = 42' --run",
-            "mncli create /tmp/cell.py --run",
-            "echo 'import pandas as pd' | mncli create --run",
-            "mncli create /tmp/cell.py --tag my-chart --run   # idempotent: rerun replaces in place",
+            "mncli create --port 2718 --tag imports --run - < /tmp/cell.py",
+            "printf 'x = 42\\n' | mncli create --port 2718 --tag answer --run -",
+            "mncli create --port 2718 /tmp/cell.py --tag my-chart --run   # rerun replaces in place",
+            "mncli create --port 2718 --code 'x = 42' --tag answer --run  # one-liner only",
         ],
     )
     _add_code_input(sp)
@@ -1393,11 +1783,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp = _subparser(sub, common, "exec",
         help="scratch-exec Python in the kernel (sees notebook state, no persistence)",
         examples=[
-            "mncli exec --code 'print(df.head())'",
-            "mncli exec /tmp/probe.py",
-            "echo 'print(plates.shape)' | mncli exec",
-            "mncli exec --code 'print(df.describe())' --json   # structured stdout/stderr/exit",
-            "mncli exec --code 'print(dir(ctx))'    # explore code_mode API",
+            "mncli exec --port 2718 --json - < /tmp/probe.py",
+            "echo 'print(plates.shape)' | mncli exec --port 2718 --json -",
+            "mncli exec --port 2718 --code 'print(df.describe())' --json   # one-liner probe",
+            "mncli exec --port 2718 --code 'print(dir(ctx))'    # explore code_mode API",
         ],
     )
     _add_code_input(sp)

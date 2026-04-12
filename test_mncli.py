@@ -33,6 +33,10 @@ def _args(**kwargs):
         "runner": "auto",
         "log": None,
         "headless": False,
+        "wait_session": False,
+        "session_timeout_seconds": 15,
+        "force_new": False,
+        "reuse": True,
         "mcp": False,
         "sandbox": None,
         "dry_run": False,
@@ -44,6 +48,53 @@ def _args(**kwargs):
 
 
 class MncliTests(unittest.TestCase):
+    def _help_output(self, *argv):
+        parser = mncli.build_parser()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit) as raised:
+                parser.parse_args([*argv, "--help"])
+        self.assertEqual(raised.exception.code, 0)
+        return out.getvalue()
+
+    def test_main_help_includes_agent_authoring_flow(self):
+        help_text = self._help_output()
+
+        self.assertIn("Agent authoring quick path", help_text)
+        self.assertIn("mncli start notebook.py --json", help_text)
+        self.assertIn("mncli create --port PORT --tag name --run -", help_text)
+        self.assertIn("Do not use --headless when you need status/create/edit/exec now", help_text)
+        self.assertIn("do not assume bare python exists", help_text)
+        self.assertIn("do not render all images/base64 blobs at once", help_text)
+
+    def test_notes_warn_about_large_media_outputs(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mncli.cmd_notes(_args())
+
+        notes = out.getvalue()
+        self.assertIn("Keep rendered outputs bounded", notes)
+        self.assertIn("inline all images as base64", notes)
+        self.assertIn("one item/page", notes)
+        self.assertIn("Start reuses matching notebooks", notes)
+        self.assertIn("mncli exec --port PORT --json -", notes)
+
+    def test_start_help_warns_headless_is_not_ready_for_cell_commands(self):
+        help_text = self._help_output("start")
+
+        self.assertIn("server only", help_text)
+        self.assertIn("open URL before cell commands", help_text)
+        self.assertIn("mncli start notebook.py --json", help_text)
+        self.assertIn("--wait-session", help_text)
+        self.assertIn("--force-new", help_text)
+
+    def test_create_help_prefers_stdin_for_multiline_code(self):
+        help_text = self._help_output("create")
+
+        self.assertIn("multiline code", help_text)
+        self.assertIn("one-liner code", help_text)
+        self.assertIn("mncli create --port 2718 --tag imports --run -", help_text)
+
     def test_default_execute_script_uses_bundled_transport(self):
         self.assertEqual(mncli.DEFAULT_EXECUTE_SCRIPT.name, "mncli-execute-code")
         self.assertTrue(mncli.DEFAULT_EXECUTE_SCRIPT.exists())
@@ -79,7 +130,30 @@ class MncliTests(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["exit_code"], 1)
         self.assertTrue(payload["transport_error"])
+        self.assertEqual(payload["kind"], "no_instances")
         self.assertEqual(payload["stderr"], stderr)
+
+    def test_status_json_keeps_transport_failure_structured(self):
+        stderr = (
+            "Multiple instances found. Use --port to specify:\n"
+            "127.0.0.1:2718\n"
+            "127.0.0.1:2719\n"
+        )
+        args = _args(json=True)
+
+        with mock.patch.object(mncli, "_run_kernel", return_value=("", stderr, 1)):
+            out = io.StringIO()
+            err = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit) as raised:
+                    mncli.cmd_status(args)
+
+        self.assertEqual(raised.exception.code, 1)
+        self.assertEqual(err.getvalue(), "")
+        payload = mncli.json.loads(out.getvalue())
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["kind"], "multiple_instances")
+        self.assertEqual(payload["ports"], ["2718", "2719"])
 
     def test_servers_lists_live_registry_entries_and_cleans_stale_entries(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -130,6 +204,28 @@ class MncliTests(unittest.TestCase):
         self.assertEqual(payload["registry"], "/registry")
         self.assertEqual([s["server_id"] for s in payload["servers"]], ["keep"])
 
+    def test_server_matches_notebook_from_mncli_sidecar_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            notebook = Path(tmp) / "analysis.py"
+            notebook.write_text("")
+            server = {
+                "pid": 123,
+                "host": "127.0.0.1",
+                "port": 2718,
+                "base_url": "",
+                "server_id": "abc",
+            }
+
+            with mock.patch.dict(mncli.os.environ, {"XDG_STATE_HOME": tmp}, clear=False):
+                mncli._write_server_state(
+                    server,
+                    notebook=notebook,
+                    log_path=Path(tmp) / "analysis.marimo.log",
+                    runner="uvx",
+                    command=["uvx", "marimo@latest", "edit", str(notebook)],
+                )
+                self.assertTrue(mncli._server_matches_notebook(server, notebook))
+
     def test_run_rejects_all_mixed_with_cell_ids(self):
         args = _args(targets=["all", "abc123"])
 
@@ -163,6 +259,43 @@ class MncliTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 2)
         self.assertIn("--tag must be a non-empty single-line value", err.getvalue())
         exec_json.assert_not_called()
+
+    def test_create_run_reports_elapsed_time(self):
+        args = _args(code="x = 1", tag="answer", run=True)
+        payload = {
+            "ok": True,
+            "id": "abcd",
+            "action": "created",
+            "ran": True,
+            "results": {"abcd": {"status": "idle", "errors": []}},
+        }
+
+        with mock.patch.object(mncli, "_exec_json", return_value=payload):
+            with mock.patch.object(mncli.time, "monotonic", side_effect=[10.0, 12.5]):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    mncli.cmd_create(args)
+
+        self.assertIn("created abcd (ran in 2.50s)", out.getvalue())
+
+    def test_create_run_json_includes_elapsed_time(self):
+        args = _args(code="x = 1", tag="answer", run=True, json=True)
+        payload = {
+            "ok": True,
+            "id": "abcd",
+            "action": "created",
+            "ran": True,
+            "results": {"abcd": {"status": "idle", "errors": []}},
+        }
+
+        with mock.patch.object(mncli, "_exec_json", return_value=payload):
+            with mock.patch.object(mncli.time, "monotonic", side_effect=[10.0, 12.5]):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    mncli.cmd_create(args)
+
+        rendered = mncli.json.loads(out.getvalue())
+        self.assertEqual(rendered["elapsed_seconds"], 2.5)
 
     def test_start_command_prefers_uvx_outside_project(self):
         args = _args(notebook="analysis.py")
@@ -288,6 +421,7 @@ class MncliTests(unittest.TestCase):
             self.assertTrue(log_path.exists())
             self.assertIn("started marimo pid 1234", out.getvalue())
             self.assertIn("registered: http://127.0.0.1:2718  pid=1234", out.getvalue())
+            self.assertIn("ready_for_cells: true", out.getvalue())
             self.assertIn("session: sess", out.getvalue())
             popen.assert_called_once()
             _, kwargs = popen.call_args
@@ -329,7 +463,120 @@ class MncliTests(unittest.TestCase):
 
             self.assertIn("sessions: none", out.getvalue())
             self.assertIn("open: http://127.0.0.1:2718", out.getvalue())
-            self.assertIn("next: open the notebook, then mncli --port 2718 status", out.getvalue())
+            self.assertIn("next: open http://127.0.0.1:2718, then run mncli --port 2718 status", out.getvalue())
+
+    def test_start_json_reports_readiness_and_next_step(self):
+        args = _args(notebook="analysis.py", runner="uvx", json=True)
+        proc = types.SimpleNamespace(pid=1234, poll=lambda: None)
+        server = {
+            "pid": 1234,
+            "host": "127.0.0.1",
+            "port": 2718,
+            "server_id": "abc",
+        }
+
+        with mock.patch.object(mncli.shutil, "which", return_value="/usr/bin/uvx"):
+            with mock.patch.object(mncli, "_discover_servers", return_value=([], Path("/registry"))):
+                with mock.patch.object(
+                    mncli,
+                    "_wait_for_server_registration",
+                    return_value=(server, Path("/registry"), None),
+                ):
+                    with mock.patch.object(mncli, "_read_server_session_ids", return_value=(["sess"], None)):
+                        with mock.patch.object(mncli.subprocess, "Popen", return_value=proc):
+                            with mock.patch.object(mncli, "_write_server_state"):
+                                out = io.StringIO()
+                                with contextlib.redirect_stdout(out):
+                                    mncli.cmd_start(args)
+
+        payload = mncli.json.loads(out.getvalue())
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["reused"])
+        self.assertTrue(payload["ready_for_cells"])
+        self.assertEqual(payload["next"], "mncli --port 2718 status")
+
+    def test_start_reuses_matching_notebook_server(self):
+        args = _args(notebook="analysis.py", runner="uvx")
+        server = {
+            "pid": 1234,
+            "host": "127.0.0.1",
+            "port": 2718,
+            "server_id": "abc",
+        }
+
+        with mock.patch.object(mncli.shutil, "which", return_value="/usr/bin/uvx"):
+            with mock.patch.object(mncli, "_discover_servers", return_value=([server], Path("/registry"))):
+                with mock.patch.object(mncli, "_server_matches_notebook", return_value=True):
+                    with mock.patch.object(mncli, "_read_server_session_ids", return_value=(["sess"], None)):
+                        with mock.patch.object(mncli.subprocess, "Popen") as popen:
+                            out = io.StringIO()
+                            with contextlib.redirect_stdout(out):
+                                mncli.cmd_start(args)
+
+        self.assertIn("reusing marimo pid 1234", out.getvalue())
+        popen.assert_not_called()
+
+    def test_start_refuses_occupied_requested_port(self):
+        args = _args(notebook="analysis.py", runner="uvx", port="2718", json=True)
+        server = {
+            "pid": 1234,
+            "host": "127.0.0.1",
+            "port": 2718,
+            "server_id": "abc",
+        }
+
+        with mock.patch.object(mncli.shutil, "which", return_value="/usr/bin/uvx"):
+            with mock.patch.object(mncli, "_discover_servers", return_value=([server], Path("/registry"))):
+                with mock.patch.object(mncli, "_server_matches_notebook", return_value=False):
+                    with mock.patch.object(mncli.subprocess, "Popen") as popen:
+                        out = io.StringIO()
+                        with contextlib.redirect_stdout(out):
+                            with self.assertRaises(SystemExit) as raised:
+                                mncli.cmd_start(args)
+
+        self.assertEqual(raised.exception.code, 2)
+        payload = mncli.json.loads(out.getvalue())
+        self.assertFalse(payload["ok"])
+        self.assertIn("already has a running marimo server", payload["error"])
+        popen.assert_not_called()
+
+    def test_start_wait_session_fails_structured_on_timeout(self):
+        args = _args(
+            notebook="analysis.py",
+            runner="uvx",
+            json=True,
+            wait_session=True,
+            session_timeout_seconds=0,
+        )
+        proc = types.SimpleNamespace(pid=1234, poll=lambda: None)
+        server = {
+            "pid": 1234,
+            "host": "127.0.0.1",
+            "port": 2718,
+            "server_id": "abc",
+        }
+
+        with mock.patch.object(mncli.shutil, "which", return_value="/usr/bin/uvx"):
+            with mock.patch.object(mncli, "_discover_servers", return_value=([], Path("/registry"))):
+                with mock.patch.object(
+                    mncli,
+                    "_wait_for_server_registration",
+                    return_value=(server, Path("/registry"), None),
+                ):
+                    with mock.patch.object(mncli, "_wait_for_server_session_ids", return_value=([], None)):
+                        with mock.patch.object(mncli.subprocess, "Popen", return_value=proc):
+                            with mock.patch.object(mncli, "_write_server_state"):
+                                out = io.StringIO()
+                                with contextlib.redirect_stdout(out):
+                                    with self.assertRaises(SystemExit) as raised:
+                                        mncli.cmd_start(args)
+
+        self.assertEqual(raised.exception.code, 1)
+        payload = mncli.json.loads(out.getvalue())
+        self.assertFalse(payload["ok"])
+        self.assertFalse(payload["ready_for_cells"])
+        self.assertIn("--wait-session timeout", payload["error"])
+
 
     def test_start_reports_immediate_exit_with_log_tail(self):
         with tempfile.TemporaryDirectory() as tmp:
